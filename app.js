@@ -37,7 +37,7 @@ const CONFIG = {
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
-    SITE_NAME: "فلاش",
+    SITE_NAME: "مركز العمليات",
     // رابط الموقع (يُستخرج من رابط الكولباك تلقائياً، أو يُحدَّد يدوياً عبر SITE_URL بمتغيرات البيئة)
     SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
@@ -354,12 +354,6 @@ const SettingsSchema = new mongoose.Schema({
     disableLogin: { type: Boolean, default: false },
     disableViolations: { type: Boolean, default: false },
     adminList: { type: [String], default: [] }, // إداريون معيّنون (يقبلون/يرفضون المخالفات فقط)
-    // صلاحيات أزرار أوامر البوت الجديدة — كل مفتاح فيه مصفوفة آيديات رتب ديسكورد مسموح لها تشوف/تستخدم الزر
-    // يحدّدها كبار المسؤولين من لوحة الموقع (مركز العمليات). كبار المسؤولين يشوفون كل الأزرار دايمًا بغض النظر عن هذي القائمة.
-    commandRolePermissions: {
-        commandControl: { type: [String], default: [] },   // أزرار /تحكم-قياده
-        personnelControl: { type: [String], default: [] }, // أزرار /تحكم-الافراد
-    },
     rankThresholds: { type: Map, of: Number, default: {} }, // رتبة -> نقاط مطلوبة للرتبة التالية
     // قادة ونواب القطاعات الثلاثة — يُعيّنهم كبار المسؤولين من الموقع (بحث عن شخص مسجل بالموقع)
     sectorLeadership: {
@@ -398,6 +392,13 @@ const SettingsSchema = new mongoose.Schema({
     lockAttendance: { type: Boolean, default: false },
     // نظام الإجازات
     leaveBalanceDefault: { type: Number, default: 10 },
+    // أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر (مركز العمليات) — الكبار يحددونها من الموقع
+    commandPermissions: {
+        violation: { type: String, default: "جندي" },   // /اصدار-مخالفة
+        command: { type: String, default: "رقيب" },      // /تحكم-قيادة
+        leave: { type: String, default: "جندي" },        // /اصدار-اجازة
+        personnel: { type: String, default: "جندي" },    // /تحكم-الافراد
+    },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -432,23 +433,6 @@ function rankIndex(rank) {
 
 function isSeniorAdmin(userId) {
     return CONFIG.SENIOR_ADMIN_IDS.includes(userId);
-}
-
-// يتحقق هل عند هذا العضو (من رولاته بديسكورد) صلاحية استخدام مفتاح معيّن من مفاتيح commandRolePermissions
-// key مثال: "commandControl" أو "personnelControl". كبار المسؤولين مسموحين دايمًا.
-async function hasCommandRole(discordId, key, settings) {
-    if (isSeniorAdmin(discordId)) return true;
-    const allowedRoleIds = settings?.commandRolePermissions?.[key] || [];
-    if (allowedRoleIds.length === 0) return false;
-    if (!botReady) return false;
-    try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        return member.roles.cache.some(r => allowedRoleIds.includes(r.id));
-    } catch (e) {
-        console.error("❌ hasCommandRole خطأ:", e.message);
-        return false;
-    }
 }
 
 async function isAnyAdmin(userId) {
@@ -835,6 +819,18 @@ async function notifyHighCommandOfPromotion(doc) {
 // إرسال المخالفة تلقائياً لقناة المخالفات فور تسجيلها من الموقع
 // يرفع صورة المخالفة كمرفق برسالة القناة، ويحفظ مرجع الرسالة بدل ما يخزن الصورة نفسها بقاعدة البيانات.
 // إذا تعذر الرفع لأي سبب (البوت متوقف، القناة محذوفة...) نحفظ الصورة احتياطياً بقاعدة البيانات عشان ما تضيع.
+// إرسال رسالة خاصة (DM) لأي عسكري بنتيجة أي إجراء عليه — مهم جداً الآن إن الموقع صار خاص بالإدارة فقط،
+// فهذي الرسالة صارت الطريقة الوحيدة اللي يعرف فيها العسكري إن طلبه اتقبل أو انرفض
+async function dmMember(discordId, embed) {
+    if (!botReady || !discordId) return;
+    try {
+        const user = await client.users.fetch(discordId);
+        await user.send({ embeds: [embed] });
+    } catch (e) {
+        console.error("❌ فشل إرسال رسالة خاصة:", discordId, e.message);
+    }
+}
+
 async function postViolationToChannel(v, rawPhoto) {
     const settings = await getSettings();
     if (!botReady || !settings.violationsChannelId) {
@@ -950,6 +946,11 @@ async function approveViolation(v, actorId, actorTag) {
     await syncViolationMessage(v);
     const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
     await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` });
+    dmMember(v.reporterDiscord, new EmbedBuilder()
+        .setTitle("✅ تم قبول مخالفتك")
+        .setColor(0x22c55e)
+        .addFields({ name: "النوع", value: label }, { name: "النقاط المكتسبة", value: `+${pts}` })
+        .setTimestamp()).catch(() => {});
     return { blocked: false };
 }
 
@@ -964,6 +965,11 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     await syncViolationMessage(v);
     const rlabel = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
     await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` });
+    dmMember(v.reporterDiscord, new EmbedBuilder()
+        .setTitle("❌ تم رفض مخالفتك")
+        .setColor(0xef4444)
+        .addFields({ name: "النوع", value: rlabel }, { name: "السبب", value: reason || "-" })
+        .setTimestamp()).catch(() => {});
     return { blocked: false };
 }
 
@@ -978,23 +984,6 @@ const commands = [
         .setName("فك-حظر")
         .setDescription("فك حظر عسكري عن الموقع (كبار المسؤولين فقط)")
         .addUserOption(o => o.setName("اللاعب").setDescription("العسكري المطلوب فك حظره").setRequired(true)),
-
-    // ── أوامر مركز العمليات (المرحلة 2 بتعبّي المنطق الكامل لها) ──
-    new SlashCommandBuilder()
-        .setName("اصدار-مخالفة")
-        .setDescription("تسجيل مخالفة على عسكري — متاح لجميع المنسوبين"),
-
-    new SlashCommandBuilder()
-        .setName("تحكم-قياده")
-        .setDescription("أزرار تحكم القيادة — مقصورة على الرتب المحددة من الإدارة"),
-
-    new SlashCommandBuilder()
-        .setName("اصدار-اجازة")
-        .setDescription("تقديم طلب إجازة — متاح لجميع المنسوبين"),
-
-    new SlashCommandBuilder()
-        .setName("تحكم-الافراد")
-        .setDescription("أزرار تحكم الأفراد (بطاقة عسكرية، المخالفات...) — مقصورة على الرتب المحددة من الإدارة"),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -1041,32 +1030,6 @@ client.on("interactionCreate", async interaction => {
                 if (!p) return interaction.reply({ content: "❌ هذا اللاعب غير مسجل بالنظام أصلاً.", ephemeral: true });
                 await logEvent({ action: "فك حظر عسكري (أمر)", discordId: target.id, discordTag: target.username, actorId: interaction.user.id, actorTag: interaction.user.username });
                 return interaction.reply({ content: `✅ تم فك حظر <@${target.id}> من الموقع.`, ephemeral: true });
-            }
-
-            if (commandName === "اصدار-مخالفة") {
-                // 🚧 المرحلة 2: بيفتح مودال بنفس أسئلة فورم المخالفة الموجود بفلاش
-                return interaction.reply({ content: "🚧 هذا الأمر قيد التطوير — بيجهز بالمرحلة القادمة.", ephemeral: true });
-            }
-
-            if (commandName === "اصدار-اجازة") {
-                // 🚧 المرحلة 2: بيفتح مودال يطلب مدة الإجازة بالأيام ويجيب رصيده
-                return interaction.reply({ content: "🚧 هذا الأمر قيد التطوير — بيجهز بالمرحلة القادمة.", ephemeral: true });
-            }
-
-            if (commandName === "تحكم-قياده") {
-                const settings = await getSettings();
-                const allowed = await hasCommandRole(interaction.user.id, "commandControl", settings);
-                if (!allowed) return interaction.reply({ content: "🚫 ما عندك صلاحية استخدام هذا الأمر.", ephemeral: true });
-                // 🚧 المرحلة 2: بيرسل نفس الأزرار والأوامر الموجودة بلوحة القيادة بفلاش
-                return interaction.reply({ content: "🚧 عندك صلاحية ✅ — الأزرار نفسها بتضاف بالمرحلة القادمة.", ephemeral: true });
-            }
-
-            if (commandName === "تحكم-الافراد") {
-                const settings = await getSettings();
-                const allowed = await hasCommandRole(interaction.user.id, "personnelControl", settings);
-                if (!allowed) return interaction.reply({ content: "🚫 ما عندك صلاحية استخدام هذا الأمر.", ephemeral: true });
-                // 🚧 المرحلة 2/3: أزرار عرض البطاقة والمخالفات المقبولة/المرفوضة/قيد المراجعة
-                return interaction.reply({ content: "🚧 عندك صلاحية ✅ — الأزرار نفسها بتضاف بالمرحلة القادمة.", ephemeral: true });
             }
             return;
         }
@@ -1290,8 +1253,27 @@ app.get("/auth/discord/callback", (req, res, next) => {
 app.get("/auth/logout", (req, res) => { req.logout(() => res.redirect("/")); });
 
 function ensureAuth(req, res, next) {
-    if (req.isAuthenticated()) return next();
-    res.status(401).json({ error: "غير مسجّل دخول" });
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    isOpsCenterUser(req.user.id).then(allowed => {
+        if (!allowed) return res.status(403).json({ error: "🚫 هذا الموقع (مركز العمليات) خاص بالإدارة فقط. استخدم بوت الأوامر بالديسكورد." });
+        next();
+    }).catch(err => {
+        console.error("❌ خطأ بالتحقق من صلاحية دخول مركز العمليات:", err.message);
+        res.status(500).json({ error: "صار خطأ بالسيرفر، حاول مرة ثانية" });
+    });
+}
+// مركز العمليات صار خاص بالإدارة فقط — هذي كل الفئات المسموح لها الدخول للموقع
+async function isOpsCenterUser(userId) {
+    if (isSeniorAdmin(userId)) return true;
+    const settings = await getSettings();
+    if ((settings.adminList || []).includes(userId)) return true;
+    if (isHighCommand(userId, settings)) return true;
+    if (getSectorRole(userId, settings)) return true;
+    if (getPersonnelOfficerSector(userId, settings)) return true;
+    if (getAttendanceOfficerSector(userId, settings)) return true;
+    if (getMPRole(userId, settings)) return true;
+    if (isMPPersonnelOfficer(userId, settings)) return true;
+    return false;
 }
 
 async function ensureSeniorAdmin(req, res, next) {
@@ -1451,8 +1433,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     let isAntiDrugs = false;
     await autoEndActiveLeave(req.user.id).catch(e => console.error("❌ فشل فحص إنهاء الإجازة التلقائي:", e.message));
 
-    // مركز العمليات: الدخول مقصور على كبار المسؤولين والإدارة (adminList) فقط — بقية المنسوبين يستخدمون أوامر البوت
-    const isOpsAdmin = senior || settings.adminList.includes(req.user.id);
     // كبار المسؤولين يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة
     if (!senior) {
         if (settings.disableLogin) {
@@ -1461,10 +1441,10 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         if (settings.isMaintenance) {
             return res.json({ blocked: true, maintenance: true, reason: "🚨 الموقع مغلق حالياً للصيانة العامة بطلب من الإدارة العليا." });
         }
-        if (!isOpsAdmin) {
-            return res.json({ blocked: true, reason: "🔒 مركز العمليات مخصص لكبار المسؤولين والإدارة فقط. استخدم أوامر البوت بالسيرفر لتسجيل المخالفات والإجازات وباقي الخدمات." });
-        }
         const check = await isMilitary(req.user.id);
+        if (!check.ok) {
+            return res.json({ blocked: true, reason: "هذا الموقع مخصص لمنسوبي الجهات العسكرية فقط" });
+        }
         isAntiDrugs = !!check.isAntiDrugs;
     } else {
         // نتحقق من الرول حتى لو كبير مسؤول، فقط عشان نعرف إذا يشوف واجهة تقارير مكافحة المخدرات
@@ -2586,6 +2566,11 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     await leave.save();
 
     await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.days} يوم (بواسطة ${approverLabel}) — الرصيد المتبقي: ${p.leaveBalance}` });
+    dmMember(p.discord, new EmbedBuilder()
+        .setTitle("✅ تم قبول طلب إجازتك")
+        .setColor(0x22c55e)
+        .addFields({ name: "المدة", value: `${leave.days} يوم` }, { name: "الرصيد المتبقي", value: `${p.leaveBalance} يوم` })
+        .setTimestamp()).catch(() => {});
     res.json({ ok: true, leave });
 });
 
@@ -2608,6 +2593,11 @@ app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     leave.endedByTag = req.user.username + ` (${approverLabel})`;
     await leave.save();
     await logEvent({ action: "إنهاء إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `بواسطة ${approverLabel}` });
+    dmMember(leave.discord, new EmbedBuilder()
+        .setTitle("⏹️ تم إنهاء إجازتك")
+        .setColor(0xf59e0b)
+        .setDescription(`تم إنهاء إجازتك النشطة بواسطة ${approverLabel}.`)
+        .setTimestamp()).catch(() => {});
     res.json({ ok: true });
 });
 
@@ -2632,6 +2622,11 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     await leave.save();
 
     await logEvent({ action: "رفض إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: leave.rejectReason || "-" });
+    dmMember(leave.discord, new EmbedBuilder()
+        .setTitle("❌ تم رفض طلب إجازتك")
+        .setColor(0xef4444)
+        .addFields({ name: "المدة المطلوبة", value: `${leave.days} يوم` }, { name: "السبب", value: leave.rejectReason || "-" })
+        .setTimestamp()).catch(() => {});
     res.json({ ok: true, leave });
 });
 
@@ -2651,6 +2646,23 @@ app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     await s.save();
     await logEvent({ action: "تعديل إعدادات الموقع", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(req.body) });
     res.json({ ok: true });
+});
+
+// أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر — يقرأها بوت الأوامر مباشرة من نفس قاعدة البيانات
+app.get("/api/senior/command-permissions", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ ranks: CONFIG.MILITARY_RANKS, permissions: settings.commandPermissions });
+});
+app.post("/api/senior/command-permissions", ensureSeniorAdmin, async (req, res) => {
+    const { violation, command, leave, personnel } = req.body;
+    const s = await getSettings();
+    for (const [key, val] of Object.entries({ violation, command, leave, personnel })) {
+        if (typeof val === "string" && CONFIG.MILITARY_RANKS.includes(val)) s.commandPermissions[key] = val;
+    }
+    s.markModified("commandPermissions");
+    await s.save();
+    await logEvent({ action: "تعديل صلاحيات أوامر البوت", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(s.commandPermissions) });
+    res.json({ ok: true, permissions: s.commandPermissions });
 });
 
 app.get("/api/senior/admins", ensureSeniorAdmin, async (req, res) => {
@@ -2674,41 +2686,6 @@ app.post("/api/senior/fire-admin", ensureSeniorAdmin, async (req, res) => {
     settings.adminList = settings.adminList.filter(id => id !== discordId);
     await settings.save();
     await logEvent({ action: "فصل إداري", discordId, actorId: req.user.id, actorTag: req.user.username });
-    res.json({ ok: true });
-});
-
-app.get("/api/senior/command-permissions", ensureSeniorAdmin, async (req, res) => {
-    const settings = await getSettings();
-    res.json({
-        commandControl: settings.commandRolePermissions?.commandControl || [],
-        personnelControl: settings.commandRolePermissions?.personnelControl || [],
-    });
-});
-
-app.post("/api/senior/command-permissions/add", ensureSeniorAdmin, async (req, res) => {
-    const { key, roleId } = req.body;
-    if (!["commandControl", "personnelControl"].includes(key)) return res.status(400).json({ error: "مفتاح غير صحيح" });
-    if (!roleId || !roleId.trim()) return res.status(400).json({ error: "حط آيدي الرتبة (الرول)" });
-    const settings = await getSettings();
-    if (!settings.commandRolePermissions) settings.commandRolePermissions = { commandControl: [], personnelControl: [] };
-    const list = settings.commandRolePermissions[key] || [];
-    if (!list.includes(roleId.trim())) list.push(roleId.trim());
-    settings.commandRolePermissions[key] = list;
-    settings.markModified("commandRolePermissions");
-    await settings.save();
-    await logEvent({ action: "إضافة صلاحية زر أمر", actorId: req.user.id, actorTag: req.user.username, details: `${key} ← رول ${roleId.trim()}` });
-    res.json({ ok: true });
-});
-
-app.post("/api/senior/command-permissions/remove", ensureSeniorAdmin, async (req, res) => {
-    const { key, roleId } = req.body;
-    if (!["commandControl", "personnelControl"].includes(key)) return res.status(400).json({ error: "مفتاح غير صحيح" });
-    const settings = await getSettings();
-    if (!settings.commandRolePermissions) settings.commandRolePermissions = { commandControl: [], personnelControl: [] };
-    settings.commandRolePermissions[key] = (settings.commandRolePermissions[key] || []).filter(id => id !== roleId);
-    settings.markModified("commandRolePermissions");
-    await settings.save();
-    await logEvent({ action: "حذف صلاحية زر أمر", actorId: req.user.id, actorTag: req.user.username, details: `${key} ← رول ${roleId}` });
     res.json({ ok: true });
 });
 
@@ -3120,11 +3097,21 @@ app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, 
         kind: "notice", reason: `🎖️ تمت ${verb} من ${oldRank} إلى ${r.toRank} — بموافقة القيادة العليا.`,
         issuedBy: req.user.id, issuedByTag: req.user.username,
     } } });
+    dmMember(r.targetDiscord, new EmbedBuilder()
+        .setTitle("🎖️ تمت الموافقة على ترقيتك/تنزيلك")
+        .setColor(0x22c55e)
+        .addFields({ name: "من رتبة", value: oldRank, inline: true }, { name: "إلى رتبة", value: r.toRank, inline: true })
+        .setTimestamp()).catch(() => {});
     if (r.requestedBy) {
         await Personnel.findOneAndUpdate({ discord: r.requestedBy }, { $push: { warnings: {
             kind: "notice", reason: `✅ انقبل طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} من القيادة العليا.`,
             issuedBy: req.user.id, issuedByTag: req.user.username,
         } } });
+        dmMember(r.requestedBy, new EmbedBuilder()
+            .setTitle("✅ تم قبول طلبك بالقيادة العليا")
+            .setColor(0x22c55e)
+            .setDescription(`طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} تم قبوله.`)
+            .setTimestamp()).catch(() => {});
     }
     // لو الطلب من مسؤول أفراد (مو قائد/نائب)، لازم قائد القطاع يعرف كمان
     const sl = (settings.sectorLeadership || {})[r.sector];
@@ -3133,6 +3120,11 @@ app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, 
             kind: "notice", reason: `🎖️ تمت ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} بأمر القيادة العليا.`,
             issuedBy: req.user.id, issuedByTag: req.user.username,
         } } });
+        dmMember(sl.commanderId, new EmbedBuilder()
+            .setTitle("🎖️ علم — تمت ترقية/تنزيل بقطاعك")
+            .setColor(0xf59e0b)
+            .setDescription(`تمت ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} بأمر القيادة العليا.`)
+            .setTimestamp()).catch(() => {});
     }
     await logEvent({
         action: r.direction === "up" ? "ترقية عسكري" : "تنزيل عسكري", discordId: p.discord, discordTag: p.discordTag,
@@ -3153,11 +3145,22 @@ app.post("/api/high-command/promotion-requests/:id/reject", ensureHighCommand, a
         kind: "notice", reason: `تم رفض طلب ${verb} من القيادة العليا. السبب: ${reason.trim()}`,
         issuedBy: req.user.id, issuedByTag: req.user.username,
     } } });
+    dmMember(r.targetDiscord, new EmbedBuilder()
+        .setTitle("❌ تم رفض طلب الترقية/التنزيل")
+        .setColor(0xef4444)
+        .addFields({ name: "السبب", value: reason.trim() })
+        .setTimestamp()).catch(() => {});
     if (r.requestedBy) {
         await Personnel.findOneAndUpdate({ discord: r.requestedBy }, { $push: { warnings: {
             kind: "notice", reason: `❌ انرفض طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من القيادة العليا. السبب: ${reason.trim()}`,
             issuedBy: req.user.id, issuedByTag: req.user.username,
         } } });
+        dmMember(r.requestedBy, new EmbedBuilder()
+            .setTitle("❌ تم رفض طلبك بالقيادة العليا")
+            .setColor(0xef4444)
+            .setDescription(`طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag}.`)
+            .addFields({ name: "السبب", value: reason.trim() })
+            .setTimestamp()).catch(() => {});
     }
     await logEvent({ action: "رفض طلب ترقية/تنزيل", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: req.user.username + " (القيادة العليا)", details: `${r.fromRank} ← ${r.toRank} — السبب: ${reason.trim()}` });
     res.json({ ok: true });
@@ -5012,7 +5015,6 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
-            <div class="tab" onclick="adminTab('cmdperms', this)">🎛️ صلاحيات أوامر البوت</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
@@ -5037,7 +5039,6 @@ function adminTab(name, el) {
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
-    if (name === 'cmdperms') loadCommandPermissions();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
     if (name === 'log') loadLog();
@@ -6879,44 +6880,6 @@ async function loadAdminsList() {
 function fireAdmin(id) {
     api('/api/senior/fire-admin', { method: 'POST', body: JSON.stringify({ discordId: id }) }).then(() => { toast('تم الفصل'); loadHire(); });
 }
-const CMD_PERM_LABELS = { commandControl: '🕹️ أزرار /تحكم-قياده', personnelControl: '👤 أزرار /تحكم-الافراد' };
-async function loadCommandPermissions() {
-    const box = document.getElementById('admin-content');
-    box.innerHTML = \`
-        <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">حط آيدي رتبة (رول) ديسكورد لكل قسم — أي عسكري معه أحد هالرتب يقدر يستخدم أزرار هذا الأمر. كبار المسؤولين يشوفون كل الأزرار دايمًا.</p>
-        <div id="cmdperm-sections"></div>\`;
-    loadCommandPermissionsList();
-}
-async function loadCommandPermissionsList() {
-    let data;
-    try { data = await api('/api/senior/command-permissions'); }
-    catch (e) { toast(e.message); return; }
-    if (currentAdminTab !== 'cmdperms') return;
-    const box = document.getElementById('cmdperm-sections');
-    if (!box) return;
-    box.innerHTML = Object.keys(CMD_PERM_LABELS).map(key => \`
-        <div class="card">
-            <h3>\${CMD_PERM_LABELS[key]}</h3>
-            <label>آيدي الرتبة (Role ID)</label>
-            <input id="cmdperm-input-\${key}" placeholder="مثال: 123456789012345678">
-            <button class="btn sm" onclick="addCommandPermRole('\${key}')">إضافة</button>
-            <div style="margin-top:10px;">
-                \${(data[key] || []).map(id => \`
-                    <div class="card row" style="margin-top:6px;"><span>\${id}</span><button class="btn danger sm" onclick="removeCommandPermRole('\${key}','\${id}')">حذف</button></div>
-                \`).join('') || '<div style="color:var(--muted);font-size:12px;">ما فيه رتب مضافة — الزر مو ظاهر لأحد غير كبار المسؤولين</div>'}
-            </div>
-        </div>\`).join('');
-}
-async function addCommandPermRole(key) {
-    const input = document.getElementById('cmdperm-input-' + key);
-    const roleId = input.value.trim();
-    if (!roleId) return toast('حط آيدي الرتبة');
-    try { await api('/api/senior/command-permissions/add', { method: 'POST', body: JSON.stringify({ key, roleId }) }); input.value = ''; toast('تمت الإضافة'); loadCommandPermissionsList(); }
-    catch (e) { toast(e.message); }
-}
-function removeCommandPermRole(key, roleId) {
-    api('/api/senior/command-permissions/remove', { method: 'POST', body: JSON.stringify({ key, roleId }) }).then(() => { toast('تم الحذف'); loadCommandPermissionsList(); });
-}
 async function loadThresholds() {
     const { ranks, thresholds } = await api('/api/senior/thresholds');
     if (currentAdminTab !== 'thresholds') return;
@@ -7267,7 +7230,40 @@ async function loadSettings() {
             <label style="margin-top:10px;">آيدي قناة إرسال صور الملاحظات بديسكورد (اختياري)</label>
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
-        </div>\`;
+        </div>
+        <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>\`;
+    loadCommandPermissions();
+}
+// أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر (مركز العمليات) — بوت الأوامر يقرأها مباشرة من نفس القاعدة
+async function loadCommandPermissions() {
+    let data;
+    try { data = await api('/api/senior/command-permissions'); } catch (e) { return; }
+    if (currentAdminTab !== 'settings') return;
+    const box = document.getElementById('cmd-perm-card');
+    if (!box) return;
+    const rankOptions = (current) => data.ranks.map(r => \`<option value="\${r}" \${r === current ? 'selected' : ''}>\${r}</option>\`).join('');
+    box.innerHTML = \`
+        <h3 style="margin-bottom:10px;">🤖 صلاحيات أوامر البوت (أقل رتبة تقدر تستخدم كل زر)</h3>
+        <label>زر /اصدار-مخالفة</label>
+        <select id="cp-violation">\${rankOptions(data.permissions.violation)}</select>
+        <label style="margin-top:10px;">زر /تحكم-قيادة</label>
+        <select id="cp-command">\${rankOptions(data.permissions.command)}</select>
+        <label style="margin-top:10px;">زر /اصدار-اجازة</label>
+        <select id="cp-leave">\${rankOptions(data.permissions.leave)}</select>
+        <label style="margin-top:10px;">زر /تحكم-الافراد</label>
+        <select id="cp-personnel">\${rankOptions(data.permissions.personnel)}</select>
+        <p style="color:var(--muted);font-size:12px;margin-top:8px;">ملاحظة: أمر /لوحة-التسجيل (تسجيل دخول/خروج) متاح للجميع بدون شرط رتبة.</p>
+        <button class="btn" style="margin-top:14px;" onclick="saveCommandPermissions()">حفظ صلاحيات الأوامر</button>\`;
+}
+async function saveCommandPermissions() {
+    const body = {
+        violation: document.getElementById('cp-violation').value,
+        command: document.getElementById('cp-command').value,
+        leave: document.getElementById('cp-leave').value,
+        personnel: document.getElementById('cp-personnel').value,
+    };
+    try { await api('/api/senior/command-permissions', { method: 'POST', body: JSON.stringify(body) }); toast('تم حفظ صلاحيات الأوامر'); }
+    catch (e) { toast(e.message); }
 }
 async function saveSettings() {
     const body = {
