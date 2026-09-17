@@ -1,0 +1,13 @@
+{
+  "name": "ops-commands-bot",
+  "version": "1.0.0",
+  "description": "بوت الأوامر العسكري المنفصل — يخدم نفس قاعدة بيانات مركز العمليات",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "mongoose": "^8.0.0"
+  }
+}
