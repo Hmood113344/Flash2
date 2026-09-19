@@ -430,6 +430,41 @@ function rankIndex(rank) {
     const i = CONFIG.MILITARY_RANKS.indexOf(rank);
     return i === -1 ? 0 : i;
 }
+function rankAtLeast(rank, minRank) {
+    return rankIndex(rank) >= rankIndex(minRank);
+}
+// يرجع سجل العسكري، أو يسويله سجل جديد أول مرة يتفاعل مع بوت الأوامر (بدون ما يحتاج يدخل الموقع أصلاً)
+async function getOrCreatePersonnel(discordId, member) {
+    let p = await Personnel.findOne({ discord: discordId });
+    if (!p) {
+        p = await Personnel.create({
+            discord: discordId,
+            discordTag: member?.user?.tag || member?.user?.username || discordId,
+            registeredName: member?.displayName || null,
+        });
+    }
+    return p;
+}
+function arabicDateTimeParts(date) {
+    const d = new Intl.DateTimeFormat("ar-SA", { timeZone: "Asia/Riyadh", day: "2-digit", month: "2-digit", year: "numeric" }).format(date);
+    const t = new Intl.DateTimeFormat("ar-SA", { timeZone: "Asia/Riyadh", hour: "2-digit", minute: "2-digit", hour12: true }).format(date);
+    const day = new Intl.DateTimeFormat("ar-SA", { timeZone: "Asia/Riyadh", weekday: "long" }).format(date);
+    return { date: d, time: t, day };
+}
+// يرسل رسالة خاصة لقائد ونائب القطاع (تستخدمها لوحة التسجيل وطلبات الإجازة الجديدة من بوت الأوامر)
+async function notifySectorLeadership(settings, sectorKey, embed) {
+    if (!sectorKey) return;
+    const sl = (settings.sectorLeadership || {})[sectorKey];
+    if (!sl) return;
+    for (const id of [sl.commanderId, sl.deputyId].filter(Boolean)) dmMember(id, embed).catch(() => {});
+}
+// يحوّل رابط مرفق ديسكورد (صورة) إلى data-URI base64 — نفس الصيغة اللي تتوقعها postViolationToChannel
+async function attachmentToBase64(url) {
+    const res = await fetch(url);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const contentType = res.headers.get("content-type") || "image/jpeg";
+    return `data:${contentType};base64,${buf.toString("base64")}`;
+}
 
 function isSeniorAdmin(userId) {
     return CONFIG.SENIOR_ADMIN_IDS.includes(userId);
@@ -973,6 +1008,271 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     return { blocked: false };
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// أوامر بوت الأوامر (نفس بوت الموقع) — أي عضو يقدر يشغّل الأمر نفسه ويفتح اللوحة،
+// لكن زر كل لوحة ما يشتغل إلا لو رتبة الشخص تحقق أقل رتبة محددة من settings.commandPermissions
+// (عدا لوحة التسجيل، متاحة للجميع بدون شرط رتبة) — كلها بلهجة سعودية رسمية
+// ══════════════════════════════════════════════════════════════════════════
+const violationSessions = new Map(); // userId -> { types: [] , vehicle: null }
+const cmdSessions = new Map();       // userId -> { targetId, direction }
+
+function brandEmbed() { return new EmbedBuilder().setColor(0xd4af37).setFooter({ text: "مركز العمليات العسكري • بوت الأوامر الرسمي" }); }
+
+async function handleViolationCommand(interaction) {
+    const settings = await getSettings();
+    const embed = brandEmbed().setTitle("📝 لوحة إصدار المخالفات العسكرية").setDescription(
+        "هذي اللوحة الرسمية لتسجيل مخالفة مرورية بحق أي مركبة أثناء الخدمة.\n\n" +
+        `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.violation} فما فوق\n\n` +
+        "اضغط الزر أدناه للبدء بتعبئة بيانات المخالفة.");
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("viol_start").setLabel("📝 إصدار مخالفة").setStyle(ButtonStyle.Primary));
+    await interaction.reply({ embeds: [embed], components: [row] });
+}
+async function handleViolationStart(interaction) {
+    const settings = await getSettings();
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (p.isBlocked) return interaction.reply({ content: "🚫 حسابك موقوف حالياً، راجع الإدارة.", ephemeral: true });
+    if (!rankAtLeast(p.rank, settings.commandPermissions.violation)) {
+        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.violation}).`, ephemeral: true });
+    }
+    const vehicles = await Vehicle.find().sort({ name: 1 }).limit(25);
+    if (!vehicles.length) return interaction.reply({ content: "❌ لا توجد مركبات مضافة بالنظام حالياً.", ephemeral: true });
+    violationSessions.set(interaction.user.id, { types: [], vehicle: null });
+    const typeMenu = new StringSelectMenuBuilder().setCustomId("viol_types_select").setPlaceholder("اختر نوع أو أكثر من أنواع المخالفة")
+        .setMinValues(1).setMaxValues(Math.min(CONFIG.VIOLATION_TYPES.length, 10))
+        .addOptions(CONFIG.VIOLATION_TYPES.map(t => ({ label: t, value: t })));
+    await interaction.reply({ content: "**الخطوة ١ من ٣ — نوع المخالفة**\nحدد نوع أو عدة أنواع للمخالفة:", components: [new ActionRowBuilder().addComponents(typeMenu)], ephemeral: true });
+}
+async function handleViolationTypesSelect(interaction) {
+    const session = violationSessions.get(interaction.user.id);
+    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    session.types = interaction.values;
+    const vehicles = await Vehicle.find().sort({ name: 1 }).limit(25);
+    const vehicleMenu = new StringSelectMenuBuilder().setCustomId("viol_vehicle_select").setPlaceholder("اختر المركبة")
+        .addOptions(vehicles.map(v => ({ label: v.name, value: v.name })));
+    await interaction.update({ content: `**الخطوة ٢ من ٣ — المركبة**\nالأنواع المحددة: ${session.types.join("، ")}`, components: [new ActionRowBuilder().addComponents(vehicleMenu)] });
+}
+async function handleViolationVehicleSelect(interaction) {
+    const session = violationSessions.get(interaction.user.id);
+    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    session.vehicle = interaction.values[0];
+    await interaction.update({ content: `**الخطوة ٣ من ٣ — صورة المخالفة (إجباري)**\nالأنواع: ${session.types.join("، ")}\nالمركبة: ${session.vehicle}\n\n📸 أرسل الآن صورة المخالفة بنفس هذه القناة خلال دقيقتين.`, components: [] });
+    const channel = interaction.channel;
+    const filter = m => m.author.id === interaction.user.id && m.attachments.size > 0;
+    try {
+        const collected = await channel.awaitMessages({ filter, max: 1, time: 120000, errors: ["time"] });
+        const msg = collected.first();
+        const attachment = msg.attachments.find(a => (a.contentType || "").startsWith("image/"));
+        if (!attachment) { violationSessions.delete(interaction.user.id); return interaction.followUp({ content: "❌ ما لقيت صورة صالحة، أعد المحاولة.", ephemeral: true }); }
+        const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+        const pendingCount = await Violation.countDocuments({ reporterDiscord: interaction.user.id, status: "pending" });
+        if (pendingCount >= 5) {
+            violationSessions.delete(interaction.user.id); msg.delete().catch(() => {});
+            return interaction.followUp({ content: "🚫 عندك 5 مخالفات معلّقة، لازم الإدارة تراجع وحدة منها أول.", ephemeral: true });
+        }
+        const v = await Violation.create({
+            reporterDiscord: interaction.user.id, reporterTag: interaction.user.username,
+            reporterName: p.registeredName || interaction.user.username, reporterUnit: p.unit,
+            violationType: session.types.join("، "), vehicle: session.vehicle, plateNumber: generatePlate(), status: "pending",
+        });
+        violationSessions.delete(interaction.user.id);
+        const base64 = await attachmentToBase64(attachment.url).catch(() => null);
+        msg.delete().catch(() => {});
+        await postViolationToChannel(v, base64);
+        await logEvent({ action: "طلب مخالفة (بوت الأوامر)", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${v.violationType} — ${v.vehicle}` });
+        await interaction.followUp({ content: "✅ تم تسجيل مخالفتك بنجاح، بانتظار مراجعة الإدارة.", ephemeral: true });
+    } catch (e) {
+        violationSessions.delete(interaction.user.id);
+        await interaction.followUp({ content: "⏱️ انتهى الوقت المحدد لإرسال الصورة، أعد المحاولة.", ephemeral: true });
+    }
+}
+
+async function handleCommandCommand(interaction) {
+    const settings = await getSettings();
+    const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
+        "لتقديم طلب ترقية أو تنزيل رتبة لأحد الأفراد — الطلب يروح مباشرة للقيادة العليا لاعتماده.\n\n" +
+        `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.command} فما فوق`);
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ تقديم طلب ترقية/تنزيل").setStyle(ButtonStyle.Primary));
+    await interaction.reply({ embeds: [embed], components: [row] });
+}
+async function handleCommandStart(interaction) {
+    const settings = await getSettings();
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (!rankAtLeast(p.rank, settings.commandPermissions.command)) {
+        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).`, ephemeral: true });
+    }
+    const menu = new UserSelectMenuBuilder().setCustomId("cmd_target_select").setPlaceholder("اختر الفرد المطلوب ترقيته أو تنزيله");
+    await interaction.reply({ content: "**الخطوة ١ من ٣ — اختيار الفرد**", components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+}
+async function handleCommandTargetSelect(interaction) {
+    const targetId = interaction.values[0];
+    const target = await getOrCreatePersonnel(targetId, null);
+    cmdSessions.set(interaction.user.id, { targetId, targetRank: target.rank });
+    const idx = rankIndex(target.rank);
+    const row = new ActionRowBuilder();
+    if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
+    if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
+    await interaction.update({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
+}
+async function handleCommandDirectionButton(interaction) {
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    session.direction = interaction.customId === "cmd_dir_up" ? "up" : "down";
+    const modal = new ModalBuilder().setCustomId("cmd_reason_modal").setTitle(session.direction === "up" ? "سبب الترقية" : "سبب التنزيل");
+    const input = new TextInputBuilder().setCustomId("reason").setLabel("اكتب السبب").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    await interaction.showModal(modal);
+}
+async function handleCommandReasonModal(interaction) {
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.reply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر.", ephemeral: true });
+    const reason = interaction.fields.getTextInputValue("reason");
+    const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+    const targetMember = await guild.members.fetch(session.targetId).catch(() => null);
+    const target = await getOrCreatePersonnel(session.targetId, targetMember);
+    const idx = rankIndex(target.rank);
+    const toRank = session.direction === "up" ? CONFIG.MILITARY_RANKS[idx + 1] : CONFIG.MILITARY_RANKS[idx - 1];
+    const sectorKey = await getMemberSectorKey(session.targetId);
+    const settings = await getSettings();
+    const doc = await PromotionRequest.create({
+        sector: sectorKey, sectorLabel: sectorKey ? CONFIG.SECTORS[sectorKey] : "غير محدد",
+        targetDiscord: session.targetId, targetTag: targetMember?.user?.username || session.targetId,
+        targetName: target.registeredName || targetMember?.displayName || session.targetId,
+        fromRank: target.rank, toRank, direction: session.direction, reason: reason.trim(),
+        requestedBy: interaction.user.id, requestedByTag: interaction.user.username,
+    });
+    cmdSessions.delete(interaction.user.id);
+    await logEvent({ action: session.direction === "up" ? "طلب ترقية (بوت الأوامر)" : "طلب تنزيل (بوت الأوامر)", discordId: session.targetId, discordTag: doc.targetTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${doc.fromRank} ← ${doc.toRank} — السبب: ${reason.trim()}` });
+    notifyHighCommandOfPromotion(doc).catch(() => {});
+    await interaction.reply({ content: `✅ تم إرسال طلبك بخصوص ${target.registeredName || "الفرد"}، بانتظار موافقة القيادة العليا.`, ephemeral: true });
+}
+
+async function handleLeaveCommand(interaction) {
+    const settings = await getSettings();
+    const embed = brandEmbed().setTitle("🌴 لوحة طلب الإجازة العسكرية").setDescription(
+        "لكل عسكري رصيد إجازات ثابت (10 أيام)، ينقص مع كل إجازة تُقبل ولا يتجدد إلا بتعديل الإدارة يدوياً.\n\n" +
+        `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.leave} فما فوق`);
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("leave_start").setLabel("🌴 طلب إجازة").setStyle(ButtonStyle.Primary));
+    await interaction.reply({ embeds: [embed], components: [row] });
+}
+async function handleLeaveStart(interaction) {
+    const settings = await getSettings();
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (!rankAtLeast(p.rank, settings.commandPermissions.leave)) {
+        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.leave}).`, ephemeral: true });
+    }
+    const modal = new ModalBuilder().setCustomId("leave_modal").setTitle("طلب إجازة عسكرية");
+    const daysInput = new TextInputBuilder().setCustomId("days").setLabel("مدة الإجازة بالأيام").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3);
+    const reasonInput = new TextInputBuilder().setCustomId("reason").setLabel("سبب الإجازة").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
+    modal.addComponents(new ActionRowBuilder().addComponents(daysInput), new ActionRowBuilder().addComponents(reasonInput));
+    await interaction.showModal(modal);
+}
+async function handleLeaveModal(interaction) {
+    const days = parseInt(interaction.fields.getTextInputValue("days"), 10);
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    if (!days || days < 1) return interaction.reply({ content: "❌ حدد عدد أيام صحيح.", ephemeral: true });
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE ?? 10;
+    if (days > balance) return interaction.reply({ content: `❌ رصيدك الحالي ${balance} يوم فقط، ما يكفي لهذا الطلب.`, ephemeral: true });
+    const pending = await LeaveRequest.countDocuments({ discord: interaction.user.id, status: "pending" });
+    if (pending >= 2) return interaction.reply({ content: "❌ عندك طلب إجازة قيد المراجعة بالفعل.", ephemeral: true });
+    const active = await LeaveRequest.findOne({ discord: interaction.user.id, status: "approved" });
+    if (active) return interaction.reply({ content: "❌ عندك إجازة نشطة حالياً.", ephemeral: true });
+    const sectorKey = await getMemberSectorKey(interaction.user.id);
+    const settings = await getSettings();
+    const leave = await LeaveRequest.create({
+        discord: interaction.user.id, discordTag: interaction.user.username,
+        name: p.registeredName || interaction.user.username, unit: p.unit, rank: p.rank,
+        sector: sectorKey, sectorLabel: sectorKey ? CONFIG.SECTORS[sectorKey] : null, reason, days,
+    });
+    await logEvent({ action: "طلب إجازة (بوت الأوامر)", discordId: p.discord, discordTag: p.discordTag, actorId: p.discord, actorTag: interaction.user.username, details: `${days} يوم — ${reason}` });
+    if (sectorKey) {
+        await notifySectorLeadership(settings, sectorKey, brandEmbed().setTitle("🌴 طلب إجازة جديد بقطاعك")
+            .addFields({ name: "الفرد", value: leave.name, inline: true }, { name: "المدة", value: `${days} يوم`, inline: true }, { name: "السبب", value: reason }).setTimestamp());
+    }
+    await interaction.reply({ content: "✅ تم إرسال طلب إجازتك، بانتظار مراجعة الإدارة.", ephemeral: true });
+}
+
+async function handlePersonnelCommand(interaction) {
+    const settings = await getSettings();
+    const embed = brandEmbed().setTitle("🪪 لوحة تحكم الأفراد").setDescription(
+        "من هنا يقدر أي عسكري يشوف بطاقته العسكرية أو مخالفاته الخاصة.\n\n" +
+        `**الرتبة المطلوبة لاستخدام الأزرار:** ${settings.commandPermissions.personnel} فما فوق`);
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("pers_card").setLabel("🪪 عرض البطاقة").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("pers_violations").setLabel("📋 مخالفاتي").setStyle(ButtonStyle.Secondary));
+    await interaction.reply({ embeds: [embed], components: [row] });
+}
+async function handlePersonnelCard(interaction) {
+    const settings = await getSettings();
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (!rankAtLeast(p.rank, settings.commandPermissions.personnel)) {
+        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).`, ephemeral: true });
+    }
+    const embed = brandEmbed().setTitle("🪪 بطاقة عسكرية").setThumbnail(interaction.user.displayAvatarURL())
+        .addFields(
+            { name: "الاسم", value: p.registeredName || interaction.user.username, inline: true },
+            { name: "الرتبة", value: p.rank, inline: true },
+            { name: "اليونت", value: p.unit || "-", inline: true },
+            { name: "النقاط", value: String(p.points), inline: true },
+            { name: "عدد الملاحظات", value: String(p.notes.length), inline: true },
+            { name: "رصيد الإجازات", value: `${p.leaveBalance ?? 10} يوم`, inline: true },
+        ).setTimestamp();
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+async function handlePersonnelViolations(interaction) {
+    const settings = await getSettings();
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (!rankAtLeast(p.rank, settings.commandPermissions.personnel)) {
+        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).`, ephemeral: true });
+    }
+    const list = await Violation.find({ reporterDiscord: interaction.user.id }).sort({ createdAt: -1 }).limit(15);
+    if (!list.length) return interaction.reply({ content: "لا توجد لديك أي مخالفات مسجّلة حتى الآن.", ephemeral: true });
+    const lines = list.map(v => {
+        const s = v.status === "pending" ? "⏳ قيد المراجعة" : v.status === "approved" ? "✅ مقبولة" : "❌ مرفوضة";
+        return `**${v.violationType}** — ${v.vehicle} — ${s}`;
+    });
+    await interaction.reply({ embeds: [brandEmbed().setTitle("📋 مخالفاتي").setDescription(lines.join("\n")).setTimestamp()], ephemeral: true });
+}
+
+async function handleAttendanceCommand(interaction) {
+    const embed = brandEmbed().setTitle("🕒 لوحة تسجيل الحضور والانصراف").setDescription("لتسجيل الدخول والخروج من الخدمة — متاحة لجميع الأفراد بدون استثناء.");
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("att_in").setLabel("🟢 تسجيل دخول").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("att_out").setLabel("🔴 تسجيل خروج").setStyle(ButtonStyle.Danger));
+    await interaction.reply({ embeds: [embed], components: [row] });
+}
+async function handleAttendanceButton(interaction) {
+    const wantIn = interaction.customId === "att_in";
+    const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    if (p.isBlocked) return interaction.reply({ content: "🚫 حسابك موقوف — راجع الإدارة.", ephemeral: true });
+    let st = await AttendanceStatus.findOne({ discord: interaction.user.id });
+    if (!st) st = await AttendanceStatus.create({ discord: interaction.user.id, discordTag: interaction.user.username });
+    if (wantIn && st.status === "in") return interaction.reply({ content: "أنت مسجّل دخول بالفعل.", ephemeral: true });
+    if (!wantIn && st.status === "out") return interaction.reply({ content: "أنت مسجّل خروج بالفعل.", ephemeral: true });
+    const sectorKey = await getMemberSectorKey(interaction.user.id);
+    const settings = await getSettings();
+    const now = new Date();
+    const newType = wantIn ? "in" : "out";
+    st.status = newType; st.discordTag = interaction.user.username;
+    st.registeredName = p.registeredName; st.unit = p.unit; st.rank = p.rank;
+    st.sectorLabel = sectorKey ? CONFIG.SECTORS[sectorKey] : st.sectorLabel;
+    if (newType === "in") {
+        const isNewDay = !st.lastCheckInAt || st.lastCheckInAt.toDateString() !== now.toDateString();
+        st.lastCheckInAt = now; st.todayCount = isNewDay ? 1 : st.todayCount + 1;
+    } else { st.lastCheckOutAt = now; }
+    st.updatedAt = now;
+    await st.save();
+    await AttendanceLog.create({ discord: interaction.user.id, discordTag: interaction.user.username, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type: newType, at: now });
+    const { date, time, day } = arabicDateTimeParts(now);
+    await interaction.reply({ content: newType === "in" ? `🟢 تم تسجيل دخولك بنجاح — ${time} — ${day} ${date}` : `🔴 تم تسجيل خروجك بنجاح — ${time} — ${day} ${date}`, ephemeral: true });
+    if (sectorKey) {
+        const embed = brandEmbed().setTitle(newType === "in" ? "🟢 تسجيل دخول" : "🔴 تسجيل خروج")
+            .setDescription(`الفرد **${st.registeredName || interaction.user.username}** ${newType === "in" ? "سجّل دخول" : "سجّل خروج"}.`)
+            .addFields({ name: "التاريخ", value: date, inline: true }, { name: "الوقت", value: time, inline: true }, { name: "اليوم", value: day, inline: true }).setTimestamp();
+        await notifySectorLeadership(settings, sectorKey, embed);
+    }
+}
+
 const commands = [
     new SlashCommandBuilder()
         .setName("حظر")
@@ -984,6 +1284,12 @@ const commands = [
         .setName("فك-حظر")
         .setDescription("فك حظر عسكري عن الموقع (كبار المسؤولين فقط)")
         .addUserOption(o => o.setName("اللاعب").setDescription("العسكري المطلوب فك حظره").setRequired(true)),
+
+    new SlashCommandBuilder().setName("اصدار-مخالفة").setDescription("فتح لوحة إصدار مخالفة عسكرية"),
+    new SlashCommandBuilder().setName("تحكم-قياده").setDescription("فتح لوحة تحكم القيادة — ترقية/تنزيل عسكري"),
+    new SlashCommandBuilder().setName("اصدار-اجازه").setDescription("فتح لوحة طلب إجازة عسكرية"),
+    new SlashCommandBuilder().setName("تحكم-الافراد").setDescription("فتح لوحة تحكم الأفراد — بطاقة تعريف ومخالفات"),
+    new SlashCommandBuilder().setName("لوحة-التسجيل").setDescription("فتح لوحة تسجيل الدخول والخروج من الخدمة"),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -1139,49 +1445,6 @@ client.once("ready", async () => {
     botReady = true;
     await registerCommands();
 });
-
-// ── قفل/فتح تسجيل الحضور بالبصمة تلقائياً بتوقيت مكة المكرمة (Asia/Riyadh) ──
-// لو محد من كبار المسؤولين قفل تسجيل الحضور يدوياً، يقفل تلقائياً الساعة 12:30 الليل،
-// ويرجع يفتح تلقائياً الساعة 12 الظهر بنفس اليوم — بدون أي تدخل يدوي، ويسجّل بلوق النظام
-function getMeccaTimeParts() {
-    const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: "Asia/Riyadh", hour: "2-digit", minute: "2-digit", hour12: false,
-        year: "numeric", month: "2-digit", day: "2-digit",
-    }).formatToParts(new Date());
-    const get = (t) => parts.find(p => p.type === t).value;
-    return { hour: parseInt(get("hour"), 10), minute: parseInt(get("minute"), 10), dateKey: `${get("year")}-${get("month")}-${get("day")}` };
-}
-let lastAutoLockDateKey = null;
-let lastAutoUnlockDateKey = null;
-setInterval(async () => {
-    try {
-        const { hour, minute, dateKey } = getMeccaTimeParts();
-        // القفل التلقائي: 12:30 الليل بالضبط (00:30) — مرة وحدة باليوم بس
-        if (hour === 0 && minute === 30 && lastAutoLockDateKey !== dateKey) {
-            lastAutoLockDateKey = dateKey;
-            const settings = await getSettings();
-            if (!settings.lockAttendance) {
-                settings.lockAttendance = true;
-                await settings.save();
-                await logEvent({ action: "قفل تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12:30 الليل بتوقيت مكة المكرمة" });
-                console.log("🔒 تم قفل تسجيل الحضور تلقائياً (12:30 الليل بتوقيت مكة)");
-            }
-        }
-        // الفتح التلقائي: 12 الظهر بالضبط بنفس اليوم — مرة وحدة باليوم بس
-        if (hour === 12 && minute === 0 && lastAutoUnlockDateKey !== dateKey) {
-            lastAutoUnlockDateKey = dateKey;
-            const settings = await getSettings();
-            if (settings.lockAttendance) {
-                settings.lockAttendance = false;
-                await settings.save();
-                await logEvent({ action: "فتح تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12 الظهر بتوقيت مكة المكرمة" });
-                console.log("🔓 تم فتح تسجيل الحضور تلقائياً (12 الظهر بتوقيت مكة)");
-            }
-        }
-    } catch (e) {
-        console.error("❌ خطأ بجدولة قفل/فتح البصمة التلقائي:", e.message);
-    }
-}, 30 * 1000);
 
 if (CONFIG.BOT_TOKEN) {
     client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
@@ -1427,6 +1690,17 @@ async function ensureJuniorInMySector(req, res, discordId) {
     return p;
 }
 
+// إحصائيات سريعة تظهر فوراً بالصفحة الرئيسية لمركز العمليات — كل شي بانتظار مراجعة الإدارة
+app.get("/api/ops-stats", ensureAuth, async (req, res) => {
+    const [pendingViolations, pendingLeaves, pendingPromotions, checkedInNow] = await Promise.all([
+        Violation.countDocuments({ status: "pending" }),
+        LeaveRequest.countDocuments({ status: "pending" }),
+        PromotionRequest.countDocuments({ status: "pending" }),
+        AttendanceStatus.countDocuments({ status: "in" }),
+    ]);
+    res.json({ pendingViolations, pendingLeaves, pendingPromotions, checkedInNow });
+});
+
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
@@ -1544,93 +1818,9 @@ app.post("/api/profile/setup", ensureAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// نظام البصمة/التحضير — بوابة إلزامية بعد تسجيل الدخول
+// نظام البصمة/التحضير — صار تسجيل الحضور والانصراف كامل عن طريق أمر البوت /لوحة-التسجيل فقط
+// (لا يوجد تسجيل حضور ذاتي بالموقع بعد الآن — الموقع صار للإدارة فقط)
 // ══════════════════════════════════════════════════════════════════════════
-// يفحص هل انقطعت "نبضات" العضو أكثر من ATTENDANCE_TIMEOUT_MS وهو مسجّل حاضر (يعني طلع من الموقع/سكر التبويب
-// بدون تسجيل انصراف يدوي) — إذا صار كذا نسجّله منصرف تلقائياً ونطلب منه يبصم من جديد. غير كذا نجدد نبضته.
-async function checkAttendanceTimeout(st, req) {
-    if (!st || st.status !== "in") return st;
-    const now = new Date();
-    if (st.lastHeartbeatAt && (now - st.lastHeartbeatAt) > CONFIG.ATTENDANCE_TIMEOUT_MS) {
-        st.status = "out";
-        st.lastCheckOutAt = now;
-        st.lastHeartbeatAt = null;
-        await st.save();
-        await AttendanceLog.create({
-            discord: req.user.id, discordTag: st.discordTag,
-            registeredName: st.registeredName, unit: st.unit, rank: st.rank,
-            type: "out", at: now,
-        });
-    } else {
-        st.lastHeartbeatAt = now;
-        await st.save();
-    }
-    return st;
-}
-app.get("/api/attendance/status", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    st = await checkAttendanceTimeout(st, req);
-    res.json({
-        status: st ? st.status : "out",
-        lockAttendance: !!settings.lockAttendance,
-    });
-});
-
-// نبضة دورية ترسلها الواجهة كل شوي طالما الموقع مفتوح عند العضو وهو مسجّل حاضر — تجدد مهلة الساعة
-app.post("/api/attendance/heartbeat", ensureAuth, async (req, res) => {
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    st = await checkAttendanceTimeout(st, req);
-    res.json({ status: st ? st.status : "out" });
-});
-
-app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    if (settings.lockAttendance && !isSeniorAdmin(req.user.id)) {
-        return res.status(423).json({ error: "🔒 تسجيل الحضور مقفل حالياً من قبل الإدارة العليا" });
-    }
-    const p = await Personnel.findOne({ discord: req.user.id });
-    if (!isSeniorAdmin(req.user.id) && p && p.isBlocked) {
-        return res.status(403).json({ error: "حسابك موقوف — راجع الإدارة" });
-    }
-
-    // فشل عشوائي بالبصمة — يحاكي بصمة حقيقية أحيانًا ما تنجح من أول مرة
-    if (Math.random() < CONFIG.FP_FAIL_RATE) {
-        return res.json({ success: false });
-    }
-
-    const sectorKey = await getMemberSectorKey(req.user.id);
-    const sectorLabel = sectorKey ? CONFIG.SECTORS[sectorKey] : null;
-
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    if (!st) st = await AttendanceStatus.create({ discord: req.user.id, discordTag: req.user.username });
-
-    const now = new Date();
-    const newType = st.status === "in" ? "out" : "in";
-    st.status = newType;
-    st.discordTag = req.user.username;
-    st.registeredName = p ? p.registeredName : st.registeredName;
-    st.unit = p ? p.unit : st.unit;
-    st.rank = p ? p.rank : st.rank;
-    st.sectorLabel = sectorLabel || st.sectorLabel;
-    if (newType === "in") {
-        const isNewDay = !st.lastCheckInAt || st.lastCheckInAt.toDateString() !== now.toDateString();
-        st.lastCheckInAt = now;
-        st.todayCount = isNewDay ? 1 : st.todayCount + 1;
-    } else {
-        st.lastCheckOutAt = now;
-    }
-    st.updatedAt = now;
-    await st.save();
-
-    await AttendanceLog.create({
-        discord: req.user.id, discordTag: req.user.username,
-        registeredName: st.registeredName, unit: st.unit, rank: st.rank,
-        type: newType, at: now,
-    });
-
-    res.json({ success: true, status: newType, at: now });
-});
 
 app.get("/api/violations/meta", ensureAuth, async (req, res) => {
     const vehicles = await Vehicle.find().sort({ name: 1 });
@@ -2383,68 +2573,6 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
     const v = await Violation.findByIdAndDelete(req.params.id);
     if (!v) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "حذف مخالفة نهائي", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId: req.user.id, actorTag: req.user.username, details: `${v.kind === "report" ? "تقرير" : "مخالفة"} (${v.status === "approved" ? "مقبولة" : "مرفوضة"})` });
-    res.json({ ok: true });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// نظام البصمة/التحضير — لوحة تحكم كبار المسؤولين
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/senior/attendance/dashboard", ensureSeniorAdmin, async (req, res) => {
-    const [total, checkedIn, todayLogs] = await Promise.all([
-        AttendanceStatus.countDocuments({}),
-        AttendanceStatus.countDocuments({ status: "in" }),
-        AttendanceLog.countDocuments({ at: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) } }),
-    ]);
-    const settings = await getSettings();
-    res.json({ total, checkedIn, checkedOut: total - checkedIn, todayLogs, lockAttendance: !!settings.lockAttendance });
-});
-
-app.get("/api/senior/attendance/members", ensureSeniorAdmin, async (req, res) => {
-    const list = await AttendanceStatus.find({}).sort({ updatedAt: -1 }).limit(300).lean();
-    res.json({ list });
-});
-
-app.post("/api/senior/attendance/members/:discord/force/:type", ensureSeniorAdmin, async (req, res) => {
-    const { discord, type } = req.params;
-    if (!["in", "out"].includes(type)) return res.status(400).json({ error: "نوع غير صحيح" });
-    let st = await AttendanceStatus.findOne({ discord });
-    if (!st) st = await AttendanceStatus.create({ discord });
-    const now = new Date();
-    st.status = type;
-    if (type === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
-    st.updatedAt = now;
-    await st.save();
-    await AttendanceLog.create({ discord, discordTag: st.discordTag, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type, at: now });
-    res.json({ ok: true });
-});
-
-app.get("/api/senior/attendance/log", ensureSeniorAdmin, async (req, res) => {
-    const logs = await AttendanceLog.find({}).sort({ at: -1 }).limit(300).maxTimeMS(10000).lean();
-    res.json({ list: logs });
-});
-
-app.post("/api/senior/attendance/settings/toggle", ensureSeniorAdmin, async (req, res) => {
-    const settings = await getSettings();
-    settings.lockAttendance = !settings.lockAttendance;
-    await settings.save();
-    res.json({ ok: true, lockAttendance: settings.lockAttendance });
-});
-
-app.post("/api/senior/attendance/force-checkout-all", ensureSeniorAdmin, async (req, res) => {
-    const now = new Date();
-    const inList = await AttendanceStatus.find({ status: "in" });
-    for (const st of inList) {
-        st.status = "out";
-        st.lastCheckOutAt = now;
-        st.updatedAt = now;
-        await st.save();
-        await AttendanceLog.create({ discord: st.discord, discordTag: st.discordTag, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type: "out", at: now });
-    }
-    res.json({ ok: true, affected: inList.length });
-});
-
-app.post("/api/senior/attendance/reset-today", ensureSeniorAdmin, async (req, res) => {
-    await AttendanceStatus.updateMany({}, { $set: { todayCount: 0 } });
     res.json({ ok: true });
 });
 
@@ -3920,7 +4048,6 @@ let reportVehiclePhoto = null;
 let currentAdminTab = null;
 let pollTimer = null;
 let blockedPollTimer = null;
-let attHeartbeatTimer = null;
 
 // يمسك آخر زر ضُغط فعليًا (يشتغل حتى على سفاري آيفون اللي ما يعطي focus للأزرار تلقائيًا عند اللمس)
 let __lastClickedBtn = null;
@@ -4367,10 +4494,6 @@ async function init() {
     lastKnownRank = ME.rank;
     buildNav();
     if (checkSummonGate()) return;
-    if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
-    let att;
-    try { att = await api('/api/attendance/status'); } catch (e) { att = { status: 'out' }; }
-    if (att.status !== 'in') { renderFingerprint('checkin'); return; }
     renderDashboard();
     checkPendingWarning();
     checkPromotionAlert();
@@ -4383,23 +4506,10 @@ function buildNav() {
     const items = [
         { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
     ];
-    if (ME.isMilitaryPolice && !ME.isSeniorAdmin) {
-        items.push({ label: '📝 تسجيل تقرير (شرطة عسكرية)', fn: "openMPReportForm('renderDashboard()')" });
-    } else if (ME.isAntiDrugs && !ME.isSeniorAdmin) {
-        items.push({ label: '📝 تسجيل تقرير', fn: 'renderNewReport()' });
-    } else {
-        items.push({ label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' });
-    }
-    items.push(
-        { label: '📋 مخالفاتي', fn: 'renderMinePage()' },
-        { label: '🌴 الإجازات', fn: 'renderLeavePage()' },
-        { label: '🪪 بطاقتي', fn: 'renderCard()' },
-    );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
-    else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     if (ME.attendanceOfficerInfo) items.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
@@ -4476,21 +4586,6 @@ async function submitLeaveRequest() {
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
-    if (attHeartbeatTimer) clearInterval(attHeartbeatTimer);
-    attHeartbeatTimer = setInterval(sendAttendanceHeartbeat, 5 * 60000);
-    sendAttendanceHeartbeat(); // نبضة فورية عند فتح اللوحة
-}
-// نرسلها كل 5 دقايق طالما اللوحة مفتوحة عنده — لو رجعت الحالة "منصرف" (يعني انقطعت نبضاته أكثر من ساعة
-// بسبب طلوعه من الموقع/سكر التبويب) نوقفه فوراً ونطلب منه يبصم من جديد
-async function sendAttendanceHeartbeat() {
-    try {
-        const att = await api('/api/attendance/heartbeat', { method: 'POST' });
-        if (att.status !== 'in') {
-            clearInterval(pollTimer);
-            clearInterval(attHeartbeatTimer);
-            renderFingerprint('checkin');
-        }
-    } catch (e) { /* تجاهل فشل النبضة المؤقت (انقطاع نت لحظي) */ }
 }
 async function pollTick() {
     if (!ME || ME.blocked) return;
@@ -4499,7 +4594,6 @@ async function pollTick() {
         if (fresh.blocked) {
             // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
             clearInterval(pollTimer);
-            clearInterval(attHeartbeatTimer);
             ME = fresh;
             renderBlocked(fresh.reason);
             startBlockedRecheck();
@@ -4511,17 +4605,9 @@ async function pollTick() {
         lastKnownRank = fresh.rank;
         ME = fresh;
         buildNav();
-        const rp = document.getElementById('home-points');
-        if (rp) {
-            document.getElementById('home-points').textContent = ME.points;
-            document.getElementById('home-rank').textContent = ME.rank;
-            const nx = document.getElementById('home-next');
-            if (nx) nx.textContent = ME.nextRank ? (ME.rank + ' ——> ' + ME.nextRank) : 'أعلى رتبة';
-            const rem = document.getElementById('home-remaining');
-            if (rem) rem.textContent = ME.nextRank ? ('متبقي ' + ME.pointsRemaining + ' نقطة للترقية') : 'وصلت لأعلى رتبة';
-        }
-        renderNotes();
+        if (document.getElementById('ops-stats-grid')) loadOpsStats();
         if (document.getElementById('mine-list')) loadMine(true);
+        if (document.getElementById('notes-box')) renderNotes();
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
         checkPendingWarning();
@@ -4592,123 +4678,42 @@ async function doSetup() {
     try { await api('/api/profile/setup', { method: 'POST', body: JSON.stringify({ name, unit }) }); init(); }
     catch (e) { toast(e.message); }
 }
-// ── بوابة البصمة/التحضير — تظهر إلزامياً أول ما يسجل دخول (وعند الانصراف) ──
-let fpHoldTimer = null, fpHoldStart = 0, fpScanning = false;
-function renderFingerprint(mode) {
-    document.getElementById('nav-links').innerHTML = '';
-    document.getElementById('mobile-menu').innerHTML = '';
-    document.getElementById('app').innerHTML = \`
-        <div class="fp-wrap">
-            <h2>\${mode === 'checkin' ? '🖐️ سجّل حضورك' : '🖐️ سجّل انصرافك'}</h2>
-            <p style="color:var(--muted);font-size:13px;margin-top:6px;">اضغط مع الاستمرار على البصمة \${${CONFIG.FP_HOLD_SECONDS}} ثوانٍ لتسجيل \${mode === 'checkin' ? 'الحضور' : 'الانصراف'}</p>
-            <div class="fp-circle" id="fp-circle"
-                onmousedown="fpHoldStart_()" onmouseup="fpHoldEnd_()" onmouseleave="fpHoldEnd_()"
-                ontouchstart="fpHoldStart_(event)" ontouchend="fpHoldEnd_()">
-                <div class="fp-fill" id="fp-fill"></div>
-                <div class="fp-icon">
-                    <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round">
-                        <path d="M50 30 C35 30 25 42 25 55 C25 65 28 72 33 80" />
-                        <path d="M50 22 C68 22 82 38 82 56 C82 63 81 70 78 76" />
-                        <path d="M50 38 C41 38 34 46 34 55 C34 68 40 76 46 83" />
-                        <path d="M50 46 C45 46 42 50 42 55 C42 63 45 69 50 74" />
-                        <path d="M58 46 C63 49 66 53 67 60 C68 68 66 75 61 82" />
-                        <path d="M50 22 C32 22 18 37 18 55 C18 60 18.5 65 20 70" />
-                    </svg>
-                </div>
-            </div>
-            <div class="fp-status" id="fp-status"></div>
-            \${mode === 'checkout' ? '<button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>' : ''}
-        </div>\`;
-    window.__fpMode = mode;
-}
-function fpHoldStart_(ev) {
-    if (fpScanning) return;
-    if (ev) ev.preventDefault();
-    fpHoldStart = Date.now();
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    circle.classList.add('scanning');
-    fill.style.transitionDuration = (${CONFIG.FP_HOLD_SECONDS} * 1000) + 'ms';
-    requestAnimationFrame(() => { fill.style.height = '100%'; });
-    fpHoldTimer = setTimeout(() => doFingerprintScan(), ${CONFIG.FP_HOLD_SECONDS} * 1000);
-}
-function fpHoldEnd_() {
-    if (fpScanning) return;
-    clearTimeout(fpHoldTimer);
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    if (circle) circle.classList.remove('scanning');
-    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
-}
-async function doFingerprintScan() {
-    fpScanning = true;
-    const statusEl = document.getElementById('fp-status');
-    statusEl.textContent = 'جارِ التحقق...';
-    statusEl.className = 'fp-status';
-    try {
-        const data = await api('/api/attendance/scan', { method: 'POST' });
-        if (!data.success) {
-            statusEl.textContent = '❌ فشلت البصمة، حاول مرة ثانية';
-            statusEl.className = 'fp-status fail';
-        } else {
-            statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف';
-            statusEl.className = 'fp-status ok';
-            setTimeout(() => { data.status === 'in' ? init() : renderFingerprint('checkin'); }, 900);
-        }
-    } catch (e) {
-        statusEl.textContent = 'تعذر الاتصال — ' + e.message;
-        statusEl.className = 'fp-status fail';
-    }
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    if (circle) circle.classList.remove('scanning');
-    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
-    fpScanning = false;
-}
 function renderDashboard() {
     document.getElementById('app').innerHTML = \`
         <div class="card row">
             <div class="row" style="gap:14px;">
                 \${ME.avatar ? \`<img class="avatar" src="\${ME.avatar}">\` : ''}
-                <div><h2 style="margin-bottom:2px;">\${ME.registeredName}</h2><div style="color:var(--muted);font-size:13px;">\${ME.unit} • \${ME.rank}</div></div>
+                <div><h2 style="margin-bottom:2px;">\${ME.registeredName || ME.discordTag}</h2><div style="color:var(--muted);font-size:13px;">\${ME.unit || '-'} • \${ME.rank}</div></div>
             </div>
             <div class="row" style="gap:8px;">
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
                 \${ME.sectorInfo ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
-                <button class="btn gray sm" onclick="renderFingerprint('checkout')">🚪 تسجيل الانصراف</button>
+                <button class="btn gray sm" onclick="renderCard()">بطاقتي</button>
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
-        <div class="id-card">
-            \${ME.avatar ? \`<div class="center"><img class="avatar" src="\${ME.avatar}" style="width:84px;height:84px;margin-bottom:10px;"></div>\` : ''}
-            <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${ME.registeredName}</div>
-            <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">${CONFIG.SITE_NAME} • بطاقة تعريف عسكرية</div>
-            <div class="rank-line" id="home-next">\${ME.rank} \${ME.nextRank ? ('——> ' + ME.nextRank) : ''}</div>
-            <div class="center" style="font-size:13px;color:var(--muted);" id="home-remaining">\${ME.nextRank ? ('متبقي ' + ME.pointsRemaining + ' نقطة للترقية') : 'وصلت لأعلى رتبة'}</div>
-        </div>
-        <div class="grid3" style="margin-top:16px;">
-            <div class="stat"><div class="num" id="home-points">\${ME.points}</div><div class="lbl">النقاط</div></div>
-            <div class="stat"><div class="num" id="mine-count">-</div><div class="lbl">مخالفاتي</div></div>
-            <div class="stat"><div class="num" id="home-rank" style="font-size:15px;">\${ME.isBlocked ? '🚫 موقوف' : '✅ فعّال'}</div><div class="lbl">الحالة</div></div>
-        </div>
         <div class="card">
-            <div class="row">
-                <h3>مخالفاتي المسجلة</h3>
-                <div class="row" style="gap:8px;">
-                    <button class="btn sm" onclick="renderCard()">بطاقتي</button>
-                    \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
-                        ? '<button class="btn sm" onclick="renderNewReport()">+ تسجيل تقرير جديد</button>'
-                        : '<button class="btn sm" onclick="renderNewViolation()">+ تسجيل مخالفة جديدة</button>') : ''}
-                </div>
-            </div>
-            <div id="notes-box" style="margin:10px 0;"></div>
-            <div id="mine-list">جارِ التحميل...</div>
+            <h3 style="margin-bottom:10px;">📊 إحصائيات مركز العمليات — بانتظار المراجعة</h3>
+            <div class="grid3" id="ops-stats-grid">جارِ التحميل...</div>
         </div>
         \${renderFabs()}
     \`;
-    loadMine();
-    renderNotes();
+    loadOpsStats();
+}
+async function loadOpsStats() {
+    const box = document.getElementById('ops-stats-grid');
+    if (!box) return;
+    try {
+        const s = await api('/api/ops-stats');
+        box.innerHTML = \`
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingViolations}</div><div class="lbl">مخالفات معلّقة</div></div>
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingLeaves}</div><div class="lbl">إجازات معلّقة</div></div>
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingPromotions}</div><div class="lbl">ترقيات/تنزيلات معلّقة</div></div>
+            <div class="stat"><div class="num" style="color:#4ade80;">\${s.checkedInNow}</div><div class="lbl">حاضرون الآن</div></div>\`;
+    } catch (e) {
+        box.innerHTML = \`<div style="color:#f87171;">تعذر تحميل الإحصائيات (\${e.message})</div>\`;
+    }
 }
 function renderNotes() {
     const box = document.getElementById('notes-box');
@@ -5020,7 +5025,6 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
-            <div class="tab" onclick="renderAttendanceControl()">🖐️ تحكم البصمة</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : '';
     document.getElementById('app').innerHTML = \`
@@ -5124,121 +5128,6 @@ async function rejectLeave(id, senior) {
 async function endLeave(id, senior) {
     if (!confirm('متأكد تبي تنهي هذي الإجازة الآن؟')) return;
     try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
-    catch (e) { toast(e.message); }
-}
-
-// ── لوحة "تحكم البصمة" لكبار المسؤولين ────────────────────────────────────
-let attTab = 'dash';
-function renderAttendanceControl() {
-    document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>🖐️ تحكم البصمة</h2><button class="btn gray sm" onclick="renderAdmin()">رجوع للوحة الإدارة</button></div>
-        <div class="tabs">
-            <div class="tab active" onclick="attTabSwitch('dash', this)">📊 لوحة التحكم</div>
-            <div class="tab" onclick="attTabSwitch('members', this)">👥 الأعضاء</div>
-            <div class="tab" onclick="attTabSwitch('log', this)">📜 السجل</div>
-            <div class="tab" onclick="attTabSwitch('settings', this)">⚙️ الإعدادات</div>
-        </div>
-        <div id="att-content"></div>\`;
-    attTabSwitch('dash');
-}
-function attTabSwitch(name, el) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    if (el) el.classList.add('active');
-    attTab = name;
-    if (name === 'dash') loadAttDash();
-    if (name === 'members') loadAttMembers();
-    if (name === 'log') loadAttLog();
-    if (name === 'settings') loadAttSettings();
-}
-async function loadAttDash() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let d;
-    try { d = await api('/api/senior/attendance/dashboard'); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'dash') return;
-    box.innerHTML = \`
-        <div class="grid3">
-            <div class="stat"><div class="num">\${d.total}</div><div class="lbl">إجمالي المسجّلين</div></div>
-            <div class="stat"><div class="num" style="color:#4ade80;">\${d.checkedIn}</div><div class="lbl">حاضرون الآن</div></div>
-            <div class="stat"><div class="num">\${d.checkedOut}</div><div class="lbl">منصرفون</div></div>
-        </div>
-        <div class="card center" style="margin-top:12px;"><div class="num" style="font-size:26px;color:var(--gold-soft);">\${d.todayLogs}</div><div class="lbl">حركات اليوم</div></div>
-        \${d.lockAttendance ? '<div class="card" style="border-color:#f87171;color:#fca5a5;margin-top:12px;">🔒 تسجيل الحضور مقفل حالياً</div>' : ''}\`;
-}
-async function loadAttMembers() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let list;
-    try { ({ list } = await api('/api/senior/attendance/members')); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'members') return;
-    box.innerHTML = list.length === 0 ? '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بعد</div>' : list.map(m => \`
-        <div class="card row">
-            <div>
-                <b>\${m.registeredName || m.discordTag}</b>
-                <div style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
-            </div>
-            <div class="row" style="gap:6px;">
-                <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? 'حاضر' : 'منصرف'}</span>
-                <button class="btn sm gray" onclick="attForceStatus('\${m.discord}','in')">تحضير</button>
-                <button class="btn sm danger" onclick="attForceStatus('\${m.discord}','out')">انصراف</button>
-            </div>
-        </div>\`).join('');
-}
-async function attForceStatus(discord, type) {
-    try { await api('/api/senior/attendance/members/' + discord + '/force/' + type, { method: 'POST' }); toast('تم التحديث'); loadAttMembers(); }
-    catch (e) { toast(e.message); }
-}
-async function loadAttLog() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let list;
-    try { ({ list } = await api('/api/senior/attendance/log')); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'log') return;
-    box.innerHTML = list.length === 0 ? '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>' : list.map(l => \`
-        <div class="card row">
-            <div>
-                <b>\${l.registeredName || l.discordTag}</b>
-                <div style="font-size:12px;color:var(--muted);">\${l.unit || '-'} • \${l.rank || '-'}</div>
-            </div>
-            <div style="text-align:left;">
-                <div style="color:\${l.type === 'in' ? '#4ade80' : '#f87171'};font-weight:700;">\${l.type === 'in' ? 'حضور' : 'انصراف'}</div>
-                <div style="color:var(--muted);font-size:11px;">\${new Date(l.at).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' })}</div>
-            </div>
-        </div>\`).join('');
-}
-async function loadAttSettings() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    let d;
-    try { d = await api('/api/senior/attendance/dashboard'); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    box.innerHTML = \`
-        <div class="card">
-            <button class="btn \${d.lockAttendance ? 'danger' : ''}" style="width:100%;margin-bottom:10px;" onclick="attToggleLock()">
-                🔒 \${d.lockAttendance ? 'إلغاء قفل تسجيل الحضور' : 'قفل تسجيل الحضور'}
-            </button>
-            <button class="btn gray" style="width:100%;margin-bottom:10px;" onclick="attForceCheckoutAll()">🚪 تسجيل خروج جماعي فوري للجميع</button>
-            <button class="btn gray" style="width:100%;" onclick="attResetToday()">🔄 تصفير عدّاد حضور اليوم</button>
-        </div>\`;
-}
-async function attToggleLock() {
-    try { await api('/api/senior/attendance/settings/toggle', { method: 'POST' }); toast('تم الحفظ'); loadAttSettings(); }
-    catch (e) { toast(e.message); }
-}
-async function attForceCheckoutAll() {
-    if (!confirm('متأكد تبي تسجل خروج جميع الحاضرين الآن؟')) return;
-    try { const r = await api('/api/senior/attendance/force-checkout-all', { method: 'POST' }); toast('تم تسجيل خروج ' + r.affected + ' عضو'); }
-    catch (e) { toast(e.message); }
-}
-async function attResetToday() {
-    if (!confirm('متأكد تبي تصفّر عدّاد حضور اليوم لجميع الأعضاء؟')) return;
-    try { await api('/api/senior/attendance/reset-today', { method: 'POST' }); toast('تم التصفير'); }
     catch (e) { toast(e.message); }
 }
 
