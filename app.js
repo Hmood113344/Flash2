@@ -45,7 +45,11 @@ const CONFIG = {
 
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
-        "1550841038938316810",
+        "1500064443537686588",
+        "1533192878510178304",
+        "1500064767082233926",
+        "1545415273438249010",
+        "1505185480394932455",
     ],
 
     // آيديات كبار المسؤولين — نفس أسلوب ملف البنك (مصفوفة ثابتة بالكود)
@@ -1015,43 +1019,48 @@ const cmdSessions = new Map();       // userId -> { targetId, direction }
 function brandEmbed() { return new EmbedBuilder().setColor(0xd4af37).setFooter({ text: "مركز العمليات العسكري • بوت الأوامر الرسمي" }); }
 
 async function handleViolationCommand(interaction) {
+    await interaction.deferReply();
+    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("📝 لوحة إصدار المخالفات العسكرية").setDescription(
         "هذي اللوحة الرسمية لتسجيل مخالفة مرورية بحق أي مركبة أثناء الخدمة.\n\n" +
         `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.violation} فما فوق\n\n` +
         "اضغط الزر أدناه للبدء بتعبئة بيانات المخالفة.");
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("viol_start").setLabel("📝 إصدار مخالفة").setStyle(ButtonStyle.Primary));
-    await interaction.reply({ embeds: [embed], components: [row] });
+    await interaction.editReply({ embeds: [embed], components: [row] });
 }
 async function handleViolationStart(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
-    if (p.isBlocked) return interaction.reply({ content: "🚫 حسابك موقوف حالياً، راجع الإدارة.", ephemeral: true });
+    if (p.isBlocked) return interaction.editReply({ content: "🚫 حسابك موقوف حالياً، راجع الإدارة." });
     if (!rankAtLeast(p.rank, settings.commandPermissions.violation)) {
-        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.violation}).`, ephemeral: true });
+        return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.violation}).` });
     }
     const vehicles = await Vehicle.find().sort({ name: 1 }).limit(25);
-    if (!vehicles.length) return interaction.reply({ content: "❌ لا توجد مركبات مضافة بالنظام حالياً.", ephemeral: true });
+    if (!vehicles.length) return interaction.editReply({ content: "❌ لا توجد مركبات مضافة بالنظام حالياً." });
     violationSessions.set(interaction.user.id, { types: [], vehicle: null });
     const typeMenu = new StringSelectMenuBuilder().setCustomId("viol_types_select").setPlaceholder("اختر نوع أو أكثر من أنواع المخالفة")
         .setMinValues(1).setMaxValues(Math.min(CONFIG.VIOLATION_TYPES.length, 10))
         .addOptions(CONFIG.VIOLATION_TYPES.map(t => ({ label: t, value: t })));
-    await interaction.reply({ content: "**الخطوة ١ من ٣ — نوع المخالفة**\nحدد نوع أو عدة أنواع للمخالفة:", components: [new ActionRowBuilder().addComponents(typeMenu)], ephemeral: true });
+    await interaction.editReply({ content: "**الخطوة ١ من ٣ — نوع المخالفة**\nحدد نوع أو عدة أنواع للمخالفة:", components: [new ActionRowBuilder().addComponents(typeMenu)] });
 }
 async function handleViolationTypesSelect(interaction) {
+    await interaction.deferUpdate();
     const session = violationSessions.get(interaction.user.id);
-    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     session.types = interaction.values;
     const vehicles = await Vehicle.find().sort({ name: 1 }).limit(25);
     const vehicleMenu = new StringSelectMenuBuilder().setCustomId("viol_vehicle_select").setPlaceholder("اختر المركبة")
         .addOptions(vehicles.map(v => ({ label: v.name, value: v.name })));
-    await interaction.update({ content: `**الخطوة ٢ من ٣ — المركبة**\nالأنواع المحددة: ${session.types.join("، ")}`, components: [new ActionRowBuilder().addComponents(vehicleMenu)] });
+    await interaction.editReply({ content: `**الخطوة ٢ من ٣ — المركبة**\nالأنواع المحددة: ${session.types.join("، ")}`, components: [new ActionRowBuilder().addComponents(vehicleMenu)] });
 }
 async function handleViolationVehicleSelect(interaction) {
+    await interaction.deferUpdate();
     const session = violationSessions.get(interaction.user.id);
-    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     session.vehicle = interaction.values[0];
-    await interaction.update({ content: `**الخطوة ٣ من ٣ — صورة المخالفة (إجباري)**\nالأنواع: ${session.types.join("، ")}\nالمركبة: ${session.vehicle}\n\n📸 أرسل الآن صورة المخالفة بنفس هذه القناة خلال دقيقتين.`, components: [] });
+    await interaction.editReply({ content: `**الخطوة ٣ من ٣ — صورة المخالفة (إجباري)**\nالأنواع: ${session.types.join("، ")}\nالمركبة: ${session.vehicle}\n\n📸 أرسل الآن صورة المخالفة بنفس هذه القناة خلال دقيقتين.`, components: [] });
     const channel = interaction.channel;
     const filter = m => m.author.id === interaction.user.id && m.attachments.size > 0;
     try {
@@ -1083,23 +1092,27 @@ async function handleViolationVehicleSelect(interaction) {
 }
 
 async function handleCommandCommand(interaction) {
+    await interaction.deferReply();
+    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
         "لتقديم طلب ترقية أو تنزيل رتبة لأحد الأفراد — الطلب يروح مباشرة للقيادة العليا لاعتماده.\n\n" +
         `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.command} فما فوق`);
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ تقديم طلب ترقية/تنزيل").setStyle(ButtonStyle.Primary));
-    await interaction.reply({ embeds: [embed], components: [row] });
+    await interaction.editReply({ embeds: [embed], components: [row] });
 }
 async function handleCommandStart(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
     if (!rankAtLeast(p.rank, settings.commandPermissions.command)) {
-        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).`, ephemeral: true });
+        return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).` });
     }
     const menu = new UserSelectMenuBuilder().setCustomId("cmd_target_select").setPlaceholder("اختر الفرد المطلوب ترقيته أو تنزيله");
-    await interaction.reply({ content: "**الخطوة ١ من ٣ — اختيار الفرد**", components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    await interaction.editReply({ content: "**الخطوة ١ من ٣ — اختيار الفرد**", components: [new ActionRowBuilder().addComponents(menu)] });
 }
 async function handleCommandTargetSelect(interaction) {
+    await interaction.deferUpdate();
     const targetId = interaction.values[0];
     const target = await getOrCreatePersonnel(targetId, null);
     cmdSessions.set(interaction.user.id, { targetId, targetRank: target.rank });
@@ -1107,11 +1120,11 @@ async function handleCommandTargetSelect(interaction) {
     const row = new ActionRowBuilder();
     if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
     if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
-    await interaction.update({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
+    await interaction.editReply({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
 }
 async function handleCommandDirectionButton(interaction) {
     const session = cmdSessions.get(interaction.user.id);
-    if (!session) return interaction.update({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    if (!session) { await interaction.deferUpdate(); return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] }); }
     session.direction = interaction.customId === "cmd_dir_up" ? "up" : "down";
     const modal = new ModalBuilder().setCustomId("cmd_reason_modal").setTitle(session.direction === "up" ? "سبب الترقية" : "سبب التنزيل");
     const input = new TextInputBuilder().setCustomId("reason").setLabel("اكتب السبب").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
@@ -1119,8 +1132,9 @@ async function handleCommandDirectionButton(interaction) {
     await interaction.showModal(modal);
 }
 async function handleCommandReasonModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const session = cmdSessions.get(interaction.user.id);
-    if (!session) return interaction.reply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر.", ephemeral: true });
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر." });
     const reason = interaction.fields.getTextInputValue("reason");
     const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
     const targetMember = await guild.members.fetch(session.targetId).catch(() => null);
@@ -1139,16 +1153,18 @@ async function handleCommandReasonModal(interaction) {
     cmdSessions.delete(interaction.user.id);
     await logEvent({ action: session.direction === "up" ? "طلب ترقية (بوت الأوامر)" : "طلب تنزيل (بوت الأوامر)", discordId: session.targetId, discordTag: doc.targetTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${doc.fromRank} ← ${doc.toRank} — السبب: ${reason.trim()}` });
     notifyHighCommandOfPromotion(doc).catch(() => {});
-    await interaction.reply({ content: `✅ تم إرسال طلبك بخصوص ${target.registeredName || "الفرد"}، بانتظار موافقة القيادة العليا.`, ephemeral: true });
+    await interaction.editReply({ content: `✅ تم إرسال طلبك بخصوص ${target.registeredName || "الفرد"}، بانتظار موافقة القيادة العليا.` });
 }
 
 async function handleLeaveCommand(interaction) {
+    await interaction.deferReply();
+    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🌴 لوحة طلب الإجازة العسكرية").setDescription(
         "لكل عسكري رصيد إجازات ثابت (10 أيام)، ينقص مع كل إجازة تُقبل ولا يتجدد إلا بتعديل الإدارة يدوياً.\n\n" +
         `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.leave} فما فوق`);
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("leave_start").setLabel("🌴 طلب إجازة").setStyle(ButtonStyle.Primary));
-    await interaction.reply({ embeds: [embed], components: [row] });
+    await interaction.editReply({ embeds: [embed], components: [row] });
 }
 async function handleLeaveStart(interaction) {
     const settings = await getSettings();
@@ -1163,16 +1179,17 @@ async function handleLeaveStart(interaction) {
     await interaction.showModal(modal);
 }
 async function handleLeaveModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const days = parseInt(interaction.fields.getTextInputValue("days"), 10);
     const reason = interaction.fields.getTextInputValue("reason").trim();
-    if (!days || days < 1) return interaction.reply({ content: "❌ حدد عدد أيام صحيح.", ephemeral: true });
+    if (!days || days < 1) return interaction.editReply({ content: "❌ حدد عدد أيام صحيح." });
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
     const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE ?? 10;
-    if (days > balance) return interaction.reply({ content: `❌ رصيدك الحالي ${balance} يوم فقط، ما يكفي لهذا الطلب.`, ephemeral: true });
+    if (days > balance) return interaction.editReply({ content: `❌ رصيدك الحالي ${balance} يوم فقط، ما يكفي لهذا الطلب.` });
     const pending = await LeaveRequest.countDocuments({ discord: interaction.user.id, status: "pending" });
-    if (pending >= 2) return interaction.reply({ content: "❌ عندك طلب إجازة قيد المراجعة بالفعل.", ephemeral: true });
+    if (pending >= 2) return interaction.editReply({ content: "❌ عندك طلب إجازة قيد المراجعة بالفعل." });
     const active = await LeaveRequest.findOne({ discord: interaction.user.id, status: "approved" });
-    if (active) return interaction.reply({ content: "❌ عندك إجازة نشطة حالياً.", ephemeral: true });
+    if (active) return interaction.editReply({ content: "❌ عندك إجازة نشطة حالياً." });
     const sectorKey = await getMemberSectorKey(interaction.user.id);
     const settings = await getSettings();
     const leave = await LeaveRequest.create({
@@ -1185,10 +1202,12 @@ async function handleLeaveModal(interaction) {
         await notifySectorLeadership(settings, sectorKey, brandEmbed().setTitle("🌴 طلب إجازة جديد بقطاعك")
             .addFields({ name: "الفرد", value: leave.name, inline: true }, { name: "المدة", value: `${days} يوم`, inline: true }, { name: "السبب", value: reason }).setTimestamp());
     }
-    await interaction.reply({ content: "✅ تم إرسال طلب إجازتك، بانتظار مراجعة الإدارة.", ephemeral: true });
+    await interaction.editReply({ content: "✅ تم إرسال طلب إجازتك، بانتظار مراجعة الإدارة." });
 }
 
 async function handlePersonnelCommand(interaction) {
+    await interaction.deferReply();
+    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🪪 لوحة تحكم الأفراد").setDescription(
         "من هنا يقدر أي عسكري يشوف بطاقته العسكرية أو مخالفاته الخاصة.\n\n" +
@@ -1196,13 +1215,14 @@ async function handlePersonnelCommand(interaction) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("pers_card").setLabel("🪪 عرض البطاقة").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("pers_violations").setLabel("📋 مخالفاتي").setStyle(ButtonStyle.Secondary));
-    await interaction.reply({ embeds: [embed], components: [row] });
+    await interaction.editReply({ embeds: [embed], components: [row] });
 }
 async function handlePersonnelCard(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
     if (!rankAtLeast(p.rank, settings.commandPermissions.personnel)) {
-        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).`, ephemeral: true });
+        return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).` });
     }
     const embed = brandEmbed().setTitle("🪪 بطاقة عسكرية").setThumbnail(interaction.user.displayAvatarURL())
         .addFields(
@@ -1213,38 +1233,42 @@ async function handlePersonnelCard(interaction) {
             { name: "عدد الملاحظات", value: String(p.notes.length), inline: true },
             { name: "رصيد الإجازات", value: `${p.leaveBalance ?? 10} يوم`, inline: true },
         ).setTimestamp();
-    await interaction.reply({ embeds: [embed], ephemeral: true });
+    await interaction.editReply({ embeds: [embed] });
 }
 async function handlePersonnelViolations(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
     if (!rankAtLeast(p.rank, settings.commandPermissions.personnel)) {
-        return interaction.reply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).`, ephemeral: true });
+        return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.personnel}).` });
     }
     const list = await Violation.find({ reporterDiscord: interaction.user.id }).sort({ createdAt: -1 }).limit(15);
-    if (!list.length) return interaction.reply({ content: "لا توجد لديك أي مخالفات مسجّلة حتى الآن.", ephemeral: true });
+    if (!list.length) return interaction.editReply({ content: "لا توجد لديك أي مخالفات مسجّلة حتى الآن." });
     const lines = list.map(v => {
         const s = v.status === "pending" ? "⏳ قيد المراجعة" : v.status === "approved" ? "✅ مقبولة" : "❌ مرفوضة";
         return `**${v.violationType}** — ${v.vehicle} — ${s}`;
     });
-    await interaction.reply({ embeds: [brandEmbed().setTitle("📋 مخالفاتي").setDescription(lines.join("\n")).setTimestamp()], ephemeral: true });
+    await interaction.editReply({ embeds: [brandEmbed().setTitle("📋 مخالفاتي").setDescription(lines.join("\n")).setTimestamp()] });
 }
 
 async function handleAttendanceCommand(interaction) {
+    await interaction.deferReply();
+    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const embed = brandEmbed().setTitle("🕒 لوحة تسجيل الحضور والانصراف").setDescription("لتسجيل الدخول والخروج من الخدمة — متاحة لجميع الأفراد بدون استثناء.");
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("att_in").setLabel("🟢 تسجيل دخول").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("att_out").setLabel("🔴 تسجيل خروج").setStyle(ButtonStyle.Danger));
-    await interaction.reply({ embeds: [embed], components: [row] });
+    await interaction.editReply({ embeds: [embed], components: [row] });
 }
 async function handleAttendanceButton(interaction) {
+    await interaction.deferReply({ ephemeral: true });
     const wantIn = interaction.customId === "att_in";
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
-    if (p.isBlocked) return interaction.reply({ content: "🚫 حسابك موقوف — راجع الإدارة.", ephemeral: true });
+    if (p.isBlocked) return interaction.editReply({ content: "🚫 حسابك موقوف — راجع الإدارة." });
     let st = await AttendanceStatus.findOne({ discord: interaction.user.id });
     if (!st) st = await AttendanceStatus.create({ discord: interaction.user.id, discordTag: interaction.user.username });
-    if (wantIn && st.status === "in") return interaction.reply({ content: "أنت مسجّل دخول بالفعل.", ephemeral: true });
-    if (!wantIn && st.status === "out") return interaction.reply({ content: "أنت مسجّل خروج بالفعل.", ephemeral: true });
+    if (wantIn && st.status === "in") return interaction.editReply({ content: "أنت مسجّل دخول بالفعل." });
+    if (!wantIn && st.status === "out") return interaction.editReply({ content: "أنت مسجّل خروج بالفعل." });
     const sectorKey = await getMemberSectorKey(interaction.user.id);
     const settings = await getSettings();
     const now = new Date();
@@ -1260,7 +1284,7 @@ async function handleAttendanceButton(interaction) {
     await st.save();
     await AttendanceLog.create({ discord: interaction.user.id, discordTag: interaction.user.username, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type: newType, at: now });
     const { date, time, day } = arabicDateTimeParts(now);
-    await interaction.reply({ content: newType === "in" ? `🟢 تم تسجيل دخولك بنجاح — ${time} — ${day} ${date}` : `🔴 تم تسجيل خروجك بنجاح — ${time} — ${day} ${date}`, ephemeral: true });
+    await interaction.editReply({ content: newType === "in" ? `🟢 تم تسجيل دخولك بنجاح — ${time} — ${day} ${date}` : `🔴 تم تسجيل خروجك بنجاح — ${time} — ${day} ${date}` });
     if (sectorKey) {
         const embed = brandEmbed().setTitle(newType === "in" ? "🟢 تسجيل دخول" : "🔴 تسجيل خروج")
             .setDescription(`الفرد **${st.registeredName || interaction.user.username}** ${newType === "in" ? "سجّل دخول" : "سجّل خروج"}.`)
@@ -1333,6 +1357,16 @@ client.on("interactionCreate", async interaction => {
                 await logEvent({ action: "فك حظر عسكري (أمر)", discordId: target.id, discordTag: target.username, actorId: interaction.user.id, actorTag: interaction.user.username });
                 return interaction.reply({ content: `✅ تم فك حظر <@${target.id}> من الموقع.`, ephemeral: true });
             }
+
+            const cmdMap = {
+                "اصدار-مخالفة": handleViolationCommand,
+                "تحكم-قياده": handleCommandCommand,
+                "اصدار-اجازه": handleLeaveCommand,
+                "تحكم-الافراد": handlePersonnelCommand,
+                "لوحة-التسجيل": handleAttendanceCommand,
+            };
+            const cmdFn = cmdMap[commandName];
+            if (cmdFn) return cmdFn(interaction);
             return;
         }
 
@@ -1366,6 +1400,30 @@ client.on("interactionCreate", async interaction => {
                 return;
             }
 
+            const btnMap = {
+                viol_start: handleViolationStart,
+                cmd_start: handleCommandStart,
+                cmd_dir_up: handleCommandDirectionButton,
+                cmd_dir_down: handleCommandDirectionButton,
+                leave_start: handleLeaveStart,
+                pers_card: handlePersonnelCard,
+                pers_violations: handlePersonnelViolations,
+                att_in: handleAttendanceButton,
+                att_out: handleAttendanceButton,
+            };
+            const btnFn = btnMap[id];
+            if (btnFn) return btnFn(interaction);
+            return;
+        }
+
+        // ── قوائم اختيار ─────────────────────────────────────────────
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === "viol_types_select") return handleViolationTypesSelect(interaction);
+            if (interaction.customId === "viol_vehicle_select") return handleViolationVehicleSelect(interaction);
+            return;
+        }
+        if (interaction.isUserSelectMenu()) {
+            if (interaction.customId === "cmd_target_select") return handleCommandTargetSelect(interaction);
             return;
         }
 
@@ -1381,9 +1439,17 @@ client.on("interactionCreate", async interaction => {
                 await rejectViolation(v, interaction.user.id, interaction.user.username, reason);
                 return interaction.reply({ content: "✅ تم رفض المخالفة وحفظ السبب.", ephemeral: true });
             }
+            if (interaction.customId === "cmd_reason_modal") return handleCommandReasonModal(interaction);
+            if (interaction.customId === "leave_modal") return handleLeaveModal(interaction);
+            return;
         }
     } catch (e) {
         console.error("❌ خطأ بالتفاعل:", e);
+        try {
+            const msg = { content: "⚠️ صار خطأ غير متوقع، حاول مرة ثانية.", ephemeral: true };
+            if (interaction.deferred || interaction.replied) await interaction.editReply(msg).catch(() => interaction.followUp(msg));
+            else await interaction.reply(msg);
+        } catch (e2) { /* تجاهل */ }
     }
 });
 
@@ -1671,7 +1737,7 @@ async function ensureMPMember(req, res, next) {
 async function ensureHighCommand(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
-    if (isHighCommand(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
+    if (isHighCommand(req.user.id, settings) || isSeniorAdmin(req.user.id) || (settings.adminList || []).includes(req.user.id)) { req.settings = settings; return next(); }
     return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
 }
 
@@ -2651,7 +2717,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
 });
 
 // كبار المسؤولين يشوفون كل طلبات الإجازات المعلّقة من كل القطاعات بصفحة وحدة
-app.get("/api/senior/leave/pending", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/leave/pending", ensureAnyAdmin, async (req, res) => {
     const list = await LeaveRequest.find({ status: { $in: ["pending", "approved"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
 });
@@ -2670,6 +2736,8 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
         approverLabel = "مسؤول الأفراد";
     } else if (isSeniorAdmin(req.user.id)) {
         approverLabel = "كبار المسؤولين";
+    } else if ((settings.adminList || []).includes(req.user.id)) {
+        approverLabel = "الإدارة";
     } else {
         return res.status(403).json({ error: "ليست لديك صلاحية الموافقة على هذا الطلب" });
     }
@@ -2710,6 +2778,7 @@ app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else if ((settings.adminList || []).includes(req.user.id)) approverLabel = "الإدارة";
     else return res.status(403).json({ error: "ليست لديك صلاحية إنهاء هذه الإجازة" });
 
     leave.status = "completed";
@@ -2736,6 +2805,7 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else if ((settings.adminList || []).includes(req.user.id)) approverLabel = "الإدارة";
     else return res.status(403).json({ error: "ليست لديك صلاحية" });
 
     leave.status = "rejected";
@@ -4504,11 +4574,6 @@ function buildNav() {
     ];
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
-    if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
-    else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
-    if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
-    if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
-    if (ME.attendanceOfficerInfo) items.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
@@ -4683,7 +4748,6 @@ function renderDashboard() {
             </div>
             <div class="row" style="gap:8px;">
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
-                \${ME.sectorInfo ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
                 <button class="btn gray sm" onclick="renderCard()">بطاقتي</button>
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
@@ -5018,11 +5082,18 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
+            <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
-        </div>\` : '';
+        </div>\` : \`
+        <div class="tabs">
+            <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
+            <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
+            <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
+            <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
+        </div>\`;
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
@@ -5041,9 +5112,32 @@ function adminTab(name, el) {
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
+    if (name === 'promotions') loadAdminPromotionsPage();
     if (name === 'log') loadLog();
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
+}
+// تبويب طلبات الترقية/التنزيل بلوحة الإدارة — يعرضها لأي إداري (وليس فقط القيادة العليا)، ويسمح له بالبت فيها
+async function loadAdminPromotionsPage() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/high-command/promotion-requests')); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
+    if (currentAdminTab !== 'promotions') return;
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات ترقية/تنزيل معلّقة حالياً</div>'; return; }
+    box.innerHTML = list.map(r => \`
+        <div class="card">
+            <div><b>\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.targetName || r.targetTag}</b></div>
+            <div style="color:var(--gold-soft);margin:4px 0;">\${r.fromRank} ← \${r.toRank}</div>
+            <div style="font-size:12px;color:var(--muted);">القطاع: \${r.sectorLabel} — قدّمه: \${r.requestedByTag}</div>
+            \${r.reason ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="hcDecide('\${r._id}','approve')">✅ قبول</button>
+                <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">❌ رفض</button>
+            </div>
+        </div>\`).join('');
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
