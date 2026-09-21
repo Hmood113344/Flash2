@@ -3970,14 +3970,8 @@ function buildNav() {
 }
 function renderFabs() {
     const fabs = [];
-    if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
+    if (ME.isAdmin) fabs.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
-    if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
-    else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
-    else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
-    if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
-    if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
-    if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
