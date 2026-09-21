@@ -595,34 +595,17 @@ async function autoEndActiveLeave(discordId) {
 // ── منطق قادة ونواب القطاعات ────────────────────────────────────────────
 // يرجع مفتاح القطاع الذي يقوده/ينوبه هذا الشخص (من إعدادات قاعدة البيانات)، أو null
 function getSectorRole(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
-        if (!sec) continue;
-        if (sec.commanderId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "commander" };
-        if (sec.deputyId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "deputy" };
-    }
-    return null;
+    return null; // نظام قيادة القطاعات اتشال بالكامل بطلب من الإدارة
 }
 
 // يرجع القطاع اللي هذا الشخص "مسؤول أفراد" فيه، أو null
 function getPersonnelOfficerSector(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
-        if (sec && sec.personnelOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
-    }
-    return null;
+    return null; // نظام قيادة القطاعات اتشال بالكامل بطلب من الإدارة
 }
 
 // يرجع القطاع اللي هذا الشخص "مسؤول تحضير" فيه، أو null
 function getAttendanceOfficerSector(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
-        if (sec && sec.attendanceOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
-    }
-    return null;
+    return null; // نظام قيادة القطاعات اتشال بالكامل بطلب من الإدارة
 }
 
 // صلاحية مسؤول الأفراد تقتصر على رتبة "رئيس رقباء" وتحت
@@ -630,16 +613,12 @@ function isJuniorRank(rank) {
     return rankIndex(rank) <= rankIndex("رئيس رقباء");
 }
 
-// ── قيادة الشرطة العسكرية ────────────────────────────────────────────────
+// ── قيادة الشرطة العسكرية (نظام الشرطة العسكرية اتشال بالكامل بطلب من الإدارة) ──
 function getMPRole(userId, settings) {
-    const sl = settings.mpLeadership || {};
-    if (sl.commanderId === userId) return "commander";
-    if (sl.deputyId === userId) return "deputy";
     return null;
 }
 function isMPPersonnelOfficer(userId, settings) {
-    const sl = settings.mpLeadership || {};
-    return !!(sl.personnelOfficerId && sl.personnelOfficerId === userId);
+    return false;
 }
 // القيادة العليا — مجموعة يعيّنها كبار المسؤولين لمراجعة طلبات الترقية/التنزيل بكل القطاعات
 function isHighCommand(userId, settings) {
@@ -804,42 +783,16 @@ async function sendSummonDM(discordId, timeLabel) {
 }
 
 async function isMilitaryPoliceMember(discordId) {
-    if (!botReady) return false;
-    try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        return member.roles.cache.has(CONFIG.MILITARY_POLICE_ROLE_ID);
-    } catch (e) { return false; }
+    return false; // نظام الشرطة العسكرية اتشال بالكامل بطلب من الإدارة
 }
 // يرجع آيديات كل حاملي رتبة الشرطة العسكرية، أو null لو تعذر الجلب فعلياً
 async function getMilitaryPoliceMemberIds() {
-    if (!botReady) return null;
-    try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const role = await guild.roles.fetch(CONFIG.MILITARY_POLICE_ROLE_ID);
-        if (!role) return [];
-        await ensureGuildMembersFetched(guild);
-        return role.members.map(m => m.id);
-    } catch (e) {
-        console.error("❌ فشل جلب أعضاء الشرطة العسكرية:", e.message);
-        return null;
-    }
+    return []; // نظام الشرطة العسكرية اتشال بالكامل بطلب من الإدارة
 }
 
 // يرجع مفتاح القطاع اللي هذا الشخص عضو فيه حسب رول ديسكورد (للاستخدام بنظام الإجازات والبصمة)
 async function getMemberSectorKey(discordId) {
-    if (!botReady) return null;
-    try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        if (member.roles.cache.has(CONFIG.ANTI_DRUGS_ROLE_ID)) return "antiDrugs";
-        if (member.roles.cache.has(CONFIG.PATROL_ROLE_ID)) return "patrol";
-        if (member.roles.cache.has(CONFIG.ROAD_SECURITY_ROLE_ID)) return "roadSecurity";
-        return null;
-    } catch (e) {
-        console.error("❌ getMemberSectorKey خطأ:", e.message);
-        return null;
-    }
+    return null; // نظام قيادة القطاعات اتشال بالكامل بطلب من الإدارة
 }
 
 function buildViolationEmbed(v) {
@@ -2293,78 +2246,6 @@ app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, re
     res.json({ ok: true });
 });
 
-// ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
-const reportLocks = new Set();
-app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
-    if (reportLocks.has(req.user.id)) {
-        return res.status(429).json({ error: "في تقرير قيد الإرسال حالياً على حسابك، انتظر لحظة." });
-    }
-    reportLocks.add(req.user.id);
-    try {
-        const settings = await getSettings();
-        if (settings.disableViolations) return res.status(403).json({ error: "تسجيل التقارير مغلق حالياً" });
-        const p = await Personnel.findOne({ discord: req.user.id });
-        if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
-        if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل تقارير جديدة" });
-        if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
-
-        const {
-            category, suspectName, arrestLocation, vehicle,
-            stopReason, securityActions, photo, items,
-        } = req.body;
-
-        if (!category || !["جنائي", "مخدرات"].includes(category)) {
-            return res.status(400).json({ error: "حدد نوع التقرير (جنائي أو مخدرات)" });
-        }
-        if (!suspectName || !arrestLocation) return res.status(400).json({ error: "أكمل اسم المتهم وموقع الضبط" });
-        if (!vehicle) return res.status(400).json({ error: "اختر المركبة" });
-        if (!stopReason) return res.status(400).json({ error: "أكمل تفاصيل العملية الميدانية" });
-        if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المركبة" });
-        if (photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
-            return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-        }
-        if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "أضف مخالفة واحدة على الأقل" });
-        if (items.length > 5) return res.status(400).json({ error: "الحد الأقصى 5 مخالفات لكل تقرير" });
-        for (const it of items) {
-            if (category === "مخدرات") {
-                if (!it.drugType || !it.drugQuantity || !it.concealMethod) return res.status(400).json({ error: "أكمل نوع المخدر وكميته وطريقة إخفائه لكل مخالفة" });
-            } else {
-                if (!it.seizedItems) return res.status(400).json({ error: "اكتب المضبوطات لكل مخالفة" });
-            }
-        }
-
-        // يمنع تسجيل تقارير جديدة لو رح توصل المعلّقة للحد الأقصى
-        const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
-        if (pendingCount + items.length > CONFIG.MAX_PENDING_ITEMS) {
-            return res.status(429).json({ error: `عندك ${pendingCount} مخالفة/تقرير معلّق حالياً، وهذا التقرير فيه ${items.length} — بيتجاوز الحد الأقصى (${CONFIG.MAX_PENDING_ITEMS}). لازم الإدارة تراجع بعضها أولاً.` });
-        }
-
-        const cleanActions = Array.isArray(securityActions) ? securityActions.map(a => String(a).trim()).filter(Boolean) : [];
-        const vehicleDoc = await Vehicle.findOne({ name: vehicle });
-
-        const created = [];
-        for (const it of items) {
-            const v = await Violation.create({
-                reporterDiscord: req.user.id, reporterTag: req.user.username,
-                reporterName: p.registeredName, reporterUnit: p.unit,
-                kind: "report", reportCategory: category,
-                suspectName, arrestLocation, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-                stopReason, securityActions: cleanActions,
-                seizedItems: category === "جنائي" ? it.seizedItems : null,
-                drugType: category === "مخدرات" ? it.drugType : null,
-                drugQuantity: category === "مخدرات" ? it.drugQuantity : null,
-                concealMethod: category === "مخدرات" ? it.concealMethod : null,
-                plateNumber: generatePlate(), status: "pending",
-            });
-            await postViolationToChannel(v, photo);
-            created.push(v);
-        }
-        res.json({ ok: true, count: created.length, reports: created });
-    } finally {
-        reportLocks.delete(req.user.id);
-    }
-});
-
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
     // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
@@ -2681,55 +2562,13 @@ app.delete("/api/senior/penalties/:id", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true, list: settings.warningPenalties });
 });
 
-app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, res) => {
-    try {
-        const { p, dismissed } = await issueWarning({
-            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
-            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
-            actorId: req.user.id, actorTag: req.user.username,
-        });
-        res.json({ ok: true, warnings: p.warnings, dismissed });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// إشعار جماعي لكل الأعضاء المسجلين بالموقع
-app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
-    const entry = { kind: "notice", reason: reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username };
-    const result = await Personnel.updateMany(
-        { registeredName: { $ne: null } },
-        { $push: { warnings: entry } }
-    );
-    await logEvent({ action: "إصدار إشعار", actorId: req.user.id, actorTag: req.user.username, details: `📢 إشعار جماعي لكل الأعضاء (${result.modifiedCount}): ${reason.trim()}` });
-    res.json({ ok: true, count: result.modifiedCount });
-});
-
-// إشعار جماعي لكل أعضاء قطاع معيّن (حسب رول ديسكورد الخاص بالقطاع) — لقائد ونائب القطاع فقط
-app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
-    const memberIds = await getSectorMemberIds(req.sectorInfo.sector);
-    if (memberIds === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية" });
-    const fullReason = `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel}: ${reason.trim()}`;
-    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username };
-    const result = await Personnel.updateMany(
-        { discord: { $in: memberIds }, registeredName: { $ne: null } },
-        { $push: { warnings: entry } }
-    );
-    await logEvent({
-        action: "إصدار إشعار قطاع", actorId: req.user.id, actorTag: req.user.username,
-        details: `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel} (${result.modifiedCount}): ${reason.trim()}`,
-    });
-    res.json({ ok: true, count: result.modifiedCount });
-});
-
-// أقرب تحذير/إشعار لهذا المستخدم لسّه ما اتعاهد عليه — تستخدمها الواجهة للبولينج تعرضه بوجهه
+// أقرب "مراجعة ملاحظة قديمة" لهذا المستخدم لسّه ما اتعاهد عليها — تستخدمها الواجهة للبولينج تعرضها بوجهه
+// (تحذير/إشعار الموقع اتشالت بالكامل بطلب من الإدارة — تصدر الآن فقط من بوت الأوامر بدون شاشة مقاطعة بالموقع)
 app.get("/api/warnings/pending", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ warning: null });
     const p = await Personnel.findOne({ discord: req.user.id }, { warnings: 1 });
     if (!p || !p.warnings || !p.warnings.length) return res.json({ warning: null });
-    const pending = p.warnings.filter(w => !w.acknowledged).sort((a, b) => a.createdAt - b.createdAt)[0];
+    const pending = p.warnings.filter(w => !w.acknowledged && w.kind === "note-review").sort((a, b) => a.createdAt - b.createdAt)[0];
     if (!pending) return res.json({ warning: null });
     res.json({ warning: {
         id: pending._id, kind: pending.kind, reason: pending.reason, createdAt: pending.createdAt,
@@ -3275,327 +3114,14 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
     const list = await Log.find().sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
-
-// ── صفحة "قادة القطاعات" (كبار المسؤولين فقط) ────────────────────────────
-app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
-    const settings = await getSettings();
-    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {} });
+// مسح كامل سجلات اللوق الشامل القديمة (كبار المسؤولين فقط) — لا يمكن التراجع عنه
+app.post("/api/senior/log/wipe", ensureSeniorAdmin, async (req, res) => {
+    const result = await Log.deleteMany({});
+    // نسجل حدث المسح نفسه كأول سجل جديد بعد التصفير
+    await logEvent({ action: "مسح اللوق الشامل بالكامل", actorId: req.user.id, actorTag: req.user.username, details: `تم حذف ${result.deletedCount} سجل قديم` });
+    res.json({ ok: true, deleted: result.deletedCount });
 });
 
-const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد", attendanceOfficer: "مسؤول تحضير" };
-
-app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, res) => {
-    const { sector } = req.params;
-    const { role, discordId } = req.body;
-    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
-    if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) {
-        return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-    }
-
-    const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[sector]) settings.sectorLeadership[sector] = {};
-    const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[sector][`${role}Id`] = person.discord;
-    settings.sectorLeadership[sector][`${role}Name`] = displayName;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "تعيين قيادة قطاع", discordId: person.discord, discordTag: person.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${displayName}`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, res) => {
-    const { sector } = req.params;
-    const { role } = req.body;
-    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
-    if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
-
-    const settings = await getSettings();
-    if (!settings.sectorLeadership || !settings.sectorLeadership[sector]) return res.json({ ok: true });
-    const sec = settings.sectorLeadership[sector];
-    const removedName = sec[`${role}Name`];
-    sec[`${role}Id`] = null;
-    sec[`${role}Name`] = null;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "إزالة قيادة قطاع", actorId: req.user.id, actorTag: req.user.username,
-        details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${removedName || "-"}`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-// ── مسارات لوحة قيادة القطاع (لقادة/نواب القطاعات، وكبار المسؤولين عبر ?sector=) ──
-app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
-    const ids = await getSectorMemberIds(req.sectorInfo.sector);
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
-    res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
-});
-
-app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
-    try {
-        const ids = await getSectorMemberIds(req.sectorInfo.sector);
-        if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-        // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
-        const list = ids.length ? await Violation.aggregate([
-            { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
-            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
-            { $project: { photo: 0 } },
-            { $sort: { createdAt: -1 } },
-            { $limit: 300 }
-        ]) : [];
-        res.json({ list, canReview: canReviewSector(req.sectorInfo) });
-    } catch (e) {
-        console.error("❌ فشل تحميل مخالفات القطاع:", e);
-        res.status(500).json({ error: "تعذر تحميل مخالفات القطاع، حاول مرة ثانية" });
-    }
-});
-
-app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لقيادة القطاع فقط" });
-    const v = await Violation.findById(req.params.id);
-    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
-    res.json({ ok: true });
-});
-
-app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لقيادة القطاع فقط" });
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
-    const v = await Violation.findById(req.params.id);
-    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
-    res.json({ ok: true });
-});
-
-// يتأكد أن الشخص المطلوب فعلاً من ضمن أعضاء قطاع هذا القائد قبل أي تعديل عليه
-async function ensureInMySector(req, res, discordId) {
-    const ids = await getSectorMemberIds(req.sectorInfo.sector);
-    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return false; }
-    if (!ids.includes(discordId)) { res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" }); return false; }
-    return true;
-}
-
-// عرض ملف عسكري كامل لعضو داخل القطاع (الصفحة الثالثة: عرض ملف عسكري في القطاع)
-app.get("/api/sector/personnel/:discord", ensureSectorLeader, async (req, res) => {
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const p = await Personnel.findOne({ discord: req.params.discord });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    res.json({ personnel: p });
-});
-
-// ترقية أو تنزيل عضو من القطاع رتبة واحدة
-// طلب ترقية/تنزيل من قائد/نائب القطاع — ما ينفّذ مباشرة، يروح كطلب معلّق للقيادة العليا (لازم سبب)
-app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, res) => {
-    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { direction, reason } = req.body; // 'up' | 'down'
-    if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الترقية/التنزيل" });
-    const p = await Personnel.findOne({ discord: req.params.discord });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    const idx = rankIndex(p.rank);
-    const newIdx = direction === "up" ? idx + 1 : idx - 1;
-    if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
-    const newRank = CONFIG.MILITARY_RANKS[newIdx];
-    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
-    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
-    const roleLabel = req.sectorInfo.role === "commander" ? "قائد" : "نائب";
-    const doc = await PromotionRequest.create({
-        sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
-        targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
-        fromRank: p.rank, toRank: newRank, direction, reason: reason.trim(),
-        requestedBy: req.user.id, requestedByTag: req.user.username + ` (${roleLabel} ${req.sectorInfo.sectorLabel})`,
-        status: "pending",
-    });
-    await logEvent({
-        action: direction === "up" ? "طلب ترقية" : "طلب تنزيل", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
-        details: `${p.rank} ← ${newRank} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
-    });
-    notifyHighCommandOfPromotion(doc).catch(() => {});
-    res.json({ ok: true, request: doc });
-});
-
-// تعيين يونت لعضو القطاع (نفس صلاحية كبار المسؤولين على نفس الحقل)
-app.post("/api/sector/personnel/:discord/unit", ensureSectorLeader, async (req, res) => {
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { unit } = req.body;
-    if (!unit || !unit.trim()) return res.status(400).json({ error: "حط اسم اليونت" });
-    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { unit: unit.trim() }, { new: true });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "تعيين يونت", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `→ ${p.unit} (بواسطة قيادة ${req.sectorInfo.sectorLabel})` });
-    res.json({ ok: true, personnel: p });
-});
-
-// إصدار تحذير/إشعار لعضو القطاع
-app.post("/api/sector/personnel/:discord/warn", ensureSectorLeader, async (req, res) => {
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    try {
-        const { p, dismissed } = await issueWarning({
-            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
-            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
-            actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
-        });
-        res.json({ ok: true, warnings: p.warnings, dismissed });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// عدد التحذيرات لعضو القطاع — تستخدمها الواجهة لتحديد شكل فورم التحذير
-app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async (req, res) => {
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
-    res.json({ count });
-});
-
-// إضافة ملاحظة على عضو القطاع
-app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
-    if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { text, image } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (image && image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image: image || null, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
-    res.json({ ok: true, notes: p.notes });
-});
-
-// ── تعيين/إزالة "مسؤول الأفراد" (يقدر عليها قائد/نائب القطاع نفسه، أو كبار المسؤولين عبر ?sector=) ──
-// مسؤول أفراد واحد بس لكل قطاع — التعيين الجديد يستبدل القديم تلقائياً
-app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req, res) => {
-    const { discordId } = req.body;
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-
-    const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
-    const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerId = person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerName = displayName;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "تعيين مسؤول أفراد", discordId: person.discord, discordTag: person.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${displayName} (بواسطة ${req.sectorInfo.role === "senior" ? "كبار المسؤولين" : "قيادة القطاع"})`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req, res) => {
-    const settings = await getSettings();
-    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
-    if (!sec || !sec.personnelOfficerId) return res.json({ ok: true });
-    const removedName = sec.personnelOfficerName;
-    sec.personnelOfficerId = null;
-    sec.personnelOfficerName = null;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "إزالة مسؤول أفراد", actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-// ── تعيين/إزالة "مسؤول التحضير" (يقدر عليها قائد/نائب القطاع نفسه، أو كبار المسؤولين عبر ?sector=) ──
-// مسؤول تحضير واحد بس لكل قطاع — يشوف حضور/بصمة أعضاء قطاعه فقط (المسجلين وغير المسجلين، وآخر سجل)
-app.post("/api/sector/attendance-officer/assign", ensureSectorLeader, async (req, res) => {
-    const { discordId } = req.body;
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-
-    const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
-    const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].attendanceOfficerId = person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].attendanceOfficerName = displayName;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "تعيين مسؤول تحضير", discordId: person.discord, discordTag: person.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${displayName} (بواسطة ${req.sectorInfo.role === "senior" ? "كبار المسؤولين" : "قيادة القطاع"})`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-app.post("/api/sector/attendance-officer/remove", ensureSectorLeader, async (req, res) => {
-    const settings = await getSettings();
-    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
-    if (!sec || !sec.attendanceOfficerId) return res.json({ ok: true });
-    const removedName = sec.attendanceOfficerName;
-    sec.attendanceOfficerId = null;
-    sec.attendanceOfficerName = null;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "إزالة مسؤول تحضير", actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-// قائمة حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) + آخر سجل حضور/انصراف لكل عضو
-// متاحة لـ: مسؤول التحضير، قائد/نائب القطاع، وكبار المسؤولين (عبر ?sector=)
-app.get("/api/sector/attendance", ensureAttendanceViewer, async (req, res) => {
-    const memberIds = await getSectorMemberIds(req.sectorInfo.sector);
-    if (memberIds === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية" });
-
-    const personnelDocs = await Personnel.find({ discord: { $in: memberIds } }, { discord: 1, discordTag: 1, registeredName: 1, unit: 1, rank: 1 }).lean();
-    const personnelMap = new Map(personnelDocs.map(p => [p.discord, p]));
-
-    const statusDocs = await AttendanceStatus.find({ discord: { $in: memberIds } }).lean();
-    const statusMap = new Map(statusDocs.map(s => [s.discord, s]));
-
-    const list = memberIds.map(discord => {
-        const p = personnelMap.get(discord) || null;
-        const st = statusMap.get(discord) || null;
-        return {
-            discord,
-            name: (p && p.registeredName) || (st && st.registeredName) || null,
-            unit: (p && p.unit) || (st && st.unit) || null,
-            rank: (p && p.rank) || (st && st.rank) || null,
-            registeredOnSite: !!(p && p.registeredName),
-            registeredForAttendance: !!st,
-            status: st ? st.status : "out",
-            lastCheckInAt: st ? st.lastCheckInAt : null,
-            lastCheckOutAt: st ? st.lastCheckOutAt : null,
-        };
-    });
-    // نرتب: الحاضرين أولاً، بعدين الأحدث تحديث
-    list.sort((a, b) => {
-        if ((a.status === "in") !== (b.status === "in")) return a.status === "in" ? -1 : 1;
-        const at = Math.max(new Date(a.lastCheckInAt || 0), new Date(a.lastCheckOutAt || 0));
-        const bt = Math.max(new Date(b.lastCheckInAt || 0), new Date(b.lastCheckOutAt || 0));
-        return bt - at;
-    });
-    res.json({ list, sectorLabel: req.sectorInfo.sectorLabel });
-});
-
-// ── طلبات ترقية/تنزيل قطاعه (سجل حالة بس — المراجعة الفعلية صارت عند القيادة العليا) ──
-app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
-    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
-    res.json({ list });
-});
 
 // ══════════════════════════════════════════════════════════════════════════
 // 4.4.1) القيادة العليا — تراجع كل طلبات الترقية/التنزيل من كل القطاعات
@@ -3735,501 +3261,6 @@ app.post("/api/senior/high-command/remove", ensureSeniorAdmin, async (req, res) 
     await settings.save();
     await logEvent({ action: "إزالة عضو من القيادة العليا", actorId: req.user.id, actorTag: req.user.username, details: removed?.name || discordId });
     res.json({ ok: true, list: settings.highCommand });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// 4.4) مسارات "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه
-// ══════════════════════════════════════════════════════════════════════════
-
-app.get("/api/personnel-officer/members", ensurePersonnelOfficer, async (req, res) => {
-    const ids = await getSectorMemberIds(req.sectorInfo.sector);
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
-    res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
-});
-
-app.get("/api/personnel-officer/personnel/:discord", ensurePersonnelOfficer, async (req, res) => {
-    const p = await ensureJuniorInMySector(req, res, req.params.discord);
-    if (!p) return;
-    res.json({ personnel: p });
-});
-
-app.post("/api/personnel-officer/personnel/:discord/note", ensurePersonnelOfficer, async (req, res) => {
-    if (!(await ensureJuniorInMySector(req, res, req.params.discord))) return;
-    const { text, image } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
-    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})` });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
-    res.json({ ok: true, notes: p.notes });
-});
-
-app.get("/api/personnel-officer/personnel/:discord/warning-info", ensurePersonnelOfficer, async (req, res) => {
-    const p = await ensureJuniorInMySector(req, res, req.params.discord);
-    if (!p) return;
-    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
-    res.json({ count });
-});
-
-app.post("/api/personnel-officer/personnel/:discord/warn", ensurePersonnelOfficer, async (req, res) => {
-    if (!(await ensureJuniorInMySector(req, res, req.params.discord))) return;
-    try {
-        const { p, dismissed } = await issueWarning({
-            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
-            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
-            actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
-        });
-        res.json({ ok: true, warnings: p.warnings, dismissed });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// طلب ترقية/تنزيل — ما يصير مباشر، يروح كطلب معلّق لقائد/نائب القطاع
-app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePersonnelOfficer, async (req, res) => {
-    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
-    const p = await ensureJuniorInMySector(req, res, req.params.discord);
-    if (!p) return;
-    const { direction, reason } = req.body;
-    if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الترقية/التنزيل" });
-    const idx = rankIndex(p.rank);
-    const newIdx = direction === "up" ? idx + 1 : idx - 1;
-    if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
-    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
-    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
-    const doc = await PromotionRequest.create({
-        sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
-        targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
-        fromRank: p.rank, toRank: CONFIG.MILITARY_RANKS[newIdx], direction, reason: reason.trim(),
-        requestedBy: req.user.id, requestedByTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, status: "pending",
-    });
-    await logEvent({
-        action: direction === "up" ? "طلب ترقية" : "طلب تنزيل", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
-        details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
-    });
-    notifyHighCommandOfPromotion(doc).catch(() => {});
-    res.json({ ok: true, request: doc });
-});
-
-// طلباته السابقة (يشوف حالتها: معلّق/موافق عليه/مرفوض)
-app.get("/api/personnel-officer/requests", ensurePersonnelOfficer, async (req, res) => {
-    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
-    res.json({ list });
-});
-
-// مخالفات الأفراد (رئيس رقباء وتحت فقط) — عرض + قبول + رفض
-app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req, res) => {
-    const ids = await getSectorMemberIds(req.sectorInfo.sector);
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
-    const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
-    // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
-    const list = juniorIds.length ? await Violation.aggregate([
-        { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
-        { $project: { photo: 0 } },
-        { $sort: { createdAt: -1 } },
-        { $limit: 300 }
-    ]) : [];
-    res.json({ list });
-});
-
-app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer, async (req, res) => {
-    const v = await Violation.findById(req.params.id);
-    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
-    const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
-    res.json({ ok: true });
-});
-
-app.post("/api/personnel-officer/violations/:id/reject", ensurePersonnelOfficer, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
-    const v = await Violation.findById(req.params.id);
-    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
-    const r = await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
-    res.json({ ok: true });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// 4.5) الشرطة العسكرية
-// ══════════════════════════════════════════════════════════════════════════
-
-// ── تعيين/إزالة قائد ونائب الشرطة العسكرية (كبار المسؤولين فقط) ──
-app.get("/api/senior/mp/leadership", ensureSeniorAdmin, async (req, res) => {
-    const settings = await getSettings();
-    res.json({ mpLeadership: settings.mpLeadership || {} });
-});
-app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
-    const { role, discordId } = req.body; // role: commander | deputy
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-    const settings = await getSettings();
-    if (!settings.mpLeadership) settings.mpLeadership = {};
-    const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.mpLeadership[role + "Id"] = person.discord;
-    settings.mpLeadership[role + "Name"] = displayName;
-    settings.markModified("mpLeadership");
-    await settings.save();
-    await logEvent({
-        action: "تعيين " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية",
-        discordId: person.discord, discordTag: person.discordTag,
-        actorId: req.user.id, actorTag: req.user.username, details: displayName,
-    });
-    res.json({ ok: true, mpLeadership: settings.mpLeadership });
-});
-app.post("/api/senior/mp/remove", ensureSeniorAdmin, async (req, res) => {
-    const { role } = req.body;
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
-    const settings = await getSettings();
-    if (!settings.mpLeadership) settings.mpLeadership = {};
-    const removedName = settings.mpLeadership[role + "Name"];
-    settings.mpLeadership[role + "Id"] = null;
-    settings.mpLeadership[role + "Name"] = null;
-    settings.markModified("mpLeadership");
-    await settings.save();
-    await logEvent({ action: "إزالة " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
-    res.json({ ok: true, mpLeadership: settings.mpLeadership });
-});
-
-// ── تعيين/إزالة مسؤول أفراد الشرطة العسكرية (قائد/نائب الشرطة العسكرية أو كبار المسؤولين) ──
-app.post("/api/mp/personnel-officer/assign", ensureMPLeader, async (req, res) => {
-    const { discordId } = req.body;
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-    const settings = req.settings;
-    if (!settings.mpLeadership) settings.mpLeadership = {};
-    settings.mpLeadership.personnelOfficerId = person.discord;
-    settings.mpLeadership.personnelOfficerName = person.registeredName || person.discordTag || person.discord;
-    settings.markModified("mpLeadership");
-    await settings.save();
-    await logEvent({ action: "تعيين مسؤول أفراد الشرطة العسكرية", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: settings.mpLeadership.personnelOfficerName });
-    res.json({ ok: true, mpLeadership: settings.mpLeadership });
-});
-app.post("/api/mp/personnel-officer/remove", ensureMPLeader, async (req, res) => {
-    const settings = req.settings;
-    if (!settings.mpLeadership) settings.mpLeadership = {};
-    const removedName = settings.mpLeadership.personnelOfficerName;
-    settings.mpLeadership.personnelOfficerId = null;
-    settings.mpLeadership.personnelOfficerName = null;
-    settings.markModified("mpLeadership");
-    await settings.save();
-    await logEvent({ action: "إزالة مسؤول أفراد الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
-    res.json({ ok: true, mpLeadership: settings.mpLeadership });
-});
-
-// ── "العساكر" — كل العساكر المسجلين بالموقع، من أعلى رتبة لأقل رتبة (لأي حامل رتبة شرطة عسكرية) ──
-app.get("/api/mp/members", ensureMPMember, async (req, res) => {
-    const list = await Personnel.find({ registeredName: { $ne: null } }, { notes: 0 });
-    list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank));
-    res.json({ list });
-});
-
-// عرض ملف عسكري كامل لأي عسكري مسجل بالموقع — لقائد ونائب الشرطة العسكرية (نفس صلاحية قادة القطاعات)
-app.get("/api/mp/personnel/:discord", ensureMPLeader, async (req, res) => {
-    const p = await Personnel.findOne({ discord: req.params.discord });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    const settings = await getSettings();
-    const progress = await rankProgress(p, settings);
-    res.json({ personnel: p, progress });
-});
-
-// إصدار تحذير/إشعار لأي عسكري — لقائد ونائب الشرطة العسكرية (نفس فورم التحذير حق كبار المسؤولين وقادة القطاعات)
-app.post("/api/mp/personnel/:discord/warn", ensureMPLeader, async (req, res) => {
-    try {
-        const { p, dismissed } = await issueWarning({
-            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
-            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
-            actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)",
-        });
-        res.json({ ok: true, warnings: p.warnings, dismissed });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.get("/api/mp/personnel/:discord/warning-info", ensureMPLeader, async (req, res) => {
-    const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
-    res.json({ count });
-});
-
-// قائمة أفراد الشرطة العسكرية أنفسهم (حاملي الرتبة) — صفحة مخصصة لقيادة الشرطة العسكرية
-app.get("/api/mp/force-members", ensureMPLeader, async (req, res) => {
-    const ids = await getMilitaryPoliceMemberIds();
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
-    res.json({ list });
-});
-
-// إشعار جماعي لكل أفراد الشرطة العسكرية (نفس فكرة إشعار القطاعات)
-app.post("/api/mp/notice-all", ensureMPLeader, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
-    const ids = await getMilitaryPoliceMemberIds();
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية" });
-    const fullReason = `📢 إشعار للشرطة العسكرية: ${reason.trim()}`;
-    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username };
-    const result = await Personnel.updateMany(
-        { discord: { $in: ids }, registeredName: { $ne: null } },
-        { $push: { warnings: entry } }
-    );
-    await logEvent({ action: "إصدار إشعار الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: `📢 (${result.modifiedCount}): ${reason.trim()}` });
-    res.json({ ok: true, count: result.modifiedCount });
-});
-
-// ── ملاحظة على أي عسكري (فورم: سبب + صورة إجبارية) ──
-app.post("/api/mp/personnel/:discord/note", ensureMPMember, async (req, res) => {
-    const { text, image } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
-    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)" });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)", details: `على ${p.registeredName || p.discord}` });
-    res.json({ ok: true, notes: p.notes });
-});
-
-// ── الاستدعاء ──
-// أي حامل رتبة شرطة عسكرية يقدر يرسل استدعاء: لو كان قائد/نائب/كبير مسؤول يصير فعّال فوراً،
-// لو عضو عادي يصير "طلب استدعاء" بانتظار قبول القيادة
-app.post("/api/mp/personnel/:discord/summon", ensureMPMember, async (req, res) => {
-    const { mode, hour, minute, ampm } = req.body;
-    if (!["now", "scheduled"].includes(mode)) return res.status(400).json({ error: "حدد نوع وقت الاستدعاء" });
-    const p = await Personnel.findOne({ discord: req.params.discord });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    if (p.summon && p.summon.status && p.summon.status !== "none") return res.status(400).json({ error: "يوجد استدعاء قائم على هذا الشخص بالفعل" });
-    let timeLabel = "الآن";
-    if (mode === "scheduled") {
-        if (!hour || !minute || !ampm || !["صباح", "مساء"].includes(ampm)) return res.status(400).json({ error: "حدد وقت الاستدعاء كاملاً (الساعة، الدقيقة، صباح/مساء)" });
-        timeLabel = `${hour}:${String(minute).padStart(2, "0")} ${ampm}`;
-    }
-    const unlockAt = computeSummonUnlockAt(mode, hour, minute, ampm);
-    const settings = req.settings;
-    const isLeaderOrSenior = !!getMPRole(req.user.id, settings) || isSeniorAdmin(req.user.id);
-    p.summon = {
-        status: isLeaderOrSenior ? "approved" : "pending",
-        mode, timeLabel, unlockAt,
-        requestedBy: req.user.id, requestedByTag: req.user.username,
-        setBy: isLeaderOrSenior ? req.user.id : null, setByTag: isLeaderOrSenior ? req.user.username : null,
-        setAt: isLeaderOrSenior ? new Date() : null, enteredAt: null,
-    };
-    await p.save();
-    await logEvent({
-        action: isLeaderOrSenior ? "استدعاء عسكري" : "طلب استدعاء", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)",
-        details: `${p.registeredName || p.discord} — ${timeLabel}`,
-    });
-    if (isLeaderOrSenior) sendSummonDM(p.discord, timeLabel);
-    res.json({ ok: true, pending: !isLeaderOrSenior });
-});
-app.post("/api/mp/personnel/:discord/summon/stop", ensureMPLeader, async (req, res) => {
-    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { summon: { status: "none" } }, { new: true });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إيقاف استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
-    res.json({ ok: true });
-});
-// طلبات الاستدعاء المعلّقة (المرسلة من أعضاء عاديين) — تحتاج قبول القيادة
-app.get("/api/mp/summon-requests", ensureMPLeader, async (req, res) => {
-    const list = await Personnel.find({ "summon.status": "pending" }, "discord discordTag registeredName rank summon");
-    res.json({ list });
-});
-app.post("/api/mp/summon-requests/:discord/approve", ensureMPLeader, async (req, res) => {
-    const p = await Personnel.findOne({ discord: req.params.discord });
-    if (!p || !p.summon || p.summon.status !== "pending") return res.status(404).json({ error: "غير موجود" });
-    p.summon.status = "approved"; p.summon.setBy = req.user.id; p.summon.setByTag = req.user.username; p.summon.setAt = new Date();
-    await p.save();
-    await logEvent({ action: "قبول طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
-    sendSummonDM(p.discord, p.summon.timeLabel);
-    res.json({ ok: true });
-});
-app.post("/api/mp/summon-requests/:discord/reject", ensureMPLeader, async (req, res) => {
-    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord, "summon.status": "pending" }, { summon: { status: "none" } }, { new: true });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "رفض طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
-    res.json({ ok: true });
-});
-// دخول الاستدعاء — يستخدمها العضو نفسه لما يجيه إشعار "لديك استدعاء"
-app.post("/api/summon/enter", ensureAuth, async (req, res) => {
-    const p = await Personnel.findOne({ discord: req.user.id });
-    if (!p || !p.summon || p.summon.status !== "approved") return res.status(400).json({ error: "لا يوجد استدعاء نشط عليك" });
-    if (p.summon.unlockAt && new Date(p.summon.unlockAt).getTime() > Date.now()) {
-        return res.status(400).json({ error: `الروم بيفتح الساعة ${p.summon.timeLabel}`, locked: true, timeLabel: p.summon.timeLabel });
-    }
-    p.summon.enteredAt = new Date();
-    await p.save();
-    res.json({ ok: true, url: CONFIG.MP_SUMMON_VOICE_URL });
-});
-
-// ── تقارير الشرطة العسكرية ──
-app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
-    const { dutyReport, patrolsCount, summonsCount, incidents, notesIssued, generalNotes } = req.body;
-    if (!dutyReport || !dutyReport.trim()) return res.status(400).json({ error: "اكتب وش سويت بالاستلام" });
-    const settings = req.settings;
-    const p = await Personnel.findOne({ discord: req.user.id });
-    const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
-    const isLeader = !!mpRole;
-    const doc = await MPReport.create({
-        reporterDiscord: req.user.id, reporterTag: req.user.username,
-        reporterName: p?.registeredName || req.user.username, reporterRank: p?.rank || "-",
-        dutyReport: dutyReport.trim(),
-        patrolsCount: Math.max(0, parseInt(patrolsCount, 10) || 0),
-        summonsCount: Math.max(0, parseInt(summonsCount, 10) || 0),
-        incidents: (incidents || "").trim().slice(0, 1000),
-        notesIssued: Array.isArray(notesIssued) ? notesIssued.slice(0, 50).map(n => ({
-            discord: n.discord, tag: n.tag, name: n.name,
-            kind: n.kind === "warning" ? "warning" : "note", reason: (n.reason || "").slice(0, 500),
-        })) : [],
-        generalNotes: (generalNotes || "").trim().slice(0, 1000),
-        status: isLeader ? "approved" : "pending",
-        reviewedBy: isLeader ? req.user.id : undefined,
-        reviewedByTag: isLeader ? req.user.username : undefined,
-        reviewedAt: isLeader ? new Date() : undefined,
-    });
-    let mpPr = null;
-    if (isLeader) {
-        // القائد/النائب ما يقدر يعطي نفسه نقاط — تقريره ينقبل تلقائياً بس النقاط تنحط بطلب معلّق لأي إداري
-        mpPr = await applyOrQueuePoints({
-            discordId: req.user.id, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
-            source: "mp-report", reason: "تقرير شرطة عسكرية (قيادة) — قبول ذاتي",
-        });
-        if (mpPr.applied) await checkAutoPromotion(req.user.id);
-        // لو النائب هو اللي قدّم، يوصل إشعار للقائد بتقريره
-        if (mpRole === "deputy" && settings.mpLeadership?.commanderId) {
-            await Personnel.findOneAndUpdate({ discord: settings.mpLeadership.commanderId }, { $push: { warnings: {
-                kind: "notice",
-                reason: `النائب ${p?.registeredName || req.user.username} قدّم تقرير شرطة عسكرية جديد — راجعه من لوحة الشرطة العسكرية.`,
-                issuedBy: req.user.id, issuedByTag: req.user.username,
-            } } });
-        }
-    }
-    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + (isLeader ? " (قيادة الشرطة العسكرية)" : " (شرطة عسكرية)"), details: isLeader ? (mpPr?.queued ? "تقرير مقبول تلقائياً — النقاط بانتظار موافقة الإدارة" : "تقرير مقبول تلقائياً") : "تقرير جديد بانتظار المراجعة" });
-    res.json({ ok: true, report: doc });
-});
-app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
-    const list = await MPReport.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
-    res.json({ list });
-});
-// كل التقارير بجميع حالاتها (معلّقة/مقبولة/مرفوضة) — قائد ونائب الشرطة العسكرية يشوفون تقارير بعض حتى لو انقبلت من قبل
-app.get("/api/mp/reports/all", ensureMPLeader, async (req, res) => {
-    const list = await MPReport.find({}).sort({ createdAt: -1 }).limit(300);
-    res.json({ list });
-});
-app.post("/api/mp/reports/:id/approve", ensureMPLeader, async (req, res) => {
-    const r = await MPReport.findById(req.params.id);
-    if (!r || r.status === "approved") return res.status(404).json({ error: "غير موجود أو مقبول أصلاً" });
-    r.status = "approved"; r.rejectReason = null; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
-    await r.save();
-    const mpPr2 = await applyOrQueuePoints({
-        discordId: r.reporterDiscord, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
-        source: "mp-report", reason: `قبول تقرير شرطة عسكرية — ${r.reporterName || r.reporterTag}`,
-    });
-    if (mpPr2.applied) await checkAutoPromotion(r.reporterDiscord);
-    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة${mpPr2.queued ? " (بانتظار موافقة الإدارة)" : ""}` });
-    res.json({ ok: true });
-});
-app.post("/api/mp/reports/:id/reject", ensureMPLeader, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
-    const r = await MPReport.findById(req.params.id);
-    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
-    r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
-    await r.save();
-    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $push: { warnings: { kind: "notice", reason: "تم رفض تقريرك — انتبه المرة الجاية. السبب: " + reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username } } });
-    await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: reason.trim() });
-    res.json({ ok: true });
-});
-// حذف تقرير نهائياً — قائد ونائب الشرطة العسكرية فقط
-app.delete("/api/mp/reports/:id", ensureMPLeader, async (req, res) => {
-    const r = await MPReport.findByIdAndDelete(req.params.id);
-    if (!r) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "حذف تقرير شرطة عسكرية نهائياً", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: r.dutyReport ? r.dutyReport.slice(0, 100) : "-" });
-    res.json({ ok: true });
-});
-
-// ── لوق القطاعات (كل شي يسويه القادة/النواب/مسؤولي الأفراد بكل القطاعات — بدون كبار المسؤولين) ──
-app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
-    // بعض إجراءات قادة/نواب القطاعات تحط "(قيادة ...)" أو "(مسؤول أفراد ...)" داخل actorTag، وبعضها داخل details بس — نبحث بالاثنين
-    const rx = /قيادة|مسؤول أفراد/;
-    const list = await Log.find({ $or: [{ actorTag: { $regex: rx } }, { details: { $regex: rx } }] }).sort({ createdAt: -1 }).limit(300);
-    res.json({ list });
-});
-// سجل كامل لكل طلبات الترقية/التنزيل (معلّقة ومقبولة ومرفوضة) — علم دائم لقيادة الشرطة العسكرية:
-// مين قدّم الطلب ومتى، وأي قيادي عليا وافق/رفض ومتى، وكل التفاصيل — بدون أي تعديل، عرض فقط
-app.get("/api/mp/promotion-log", ensureMPLeader, async (req, res) => {
-    const list = await PromotionRequest.find({}).sort({ createdAt: -1 }).limit(300);
-    res.json({ list });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// 4.6) مسارات مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية أنفسهم (ما عدا القائد والنائب)
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/mp/po/members", ensureMPPersonnelOfficer, async (req, res) => {
-    const ids = await getMilitaryPoliceMemberIds();
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const settings = req.settings;
-    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
-    const filtered = ids.filter(id => !excludeIds.includes(id));
-    const list = filtered.length ? await Personnel.find({ discord: { $in: filtered } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
-    res.json({ list });
-});
-app.post("/api/mp/po/personnel/:discord/note", ensureMPPersonnelOfficer, async (req, res) => {
-    const settings = req.settings;
-    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
-    if (excludeIds.includes(req.params.discord)) return res.status(403).json({ error: "ما تقدر تحط ملاحظة على القائد أو النائب" });
-    const ids = await getMilitaryPoliceMemberIds();
-    if (ids === null) return res.status(503).json({ error: "تعذر التحقق من أعضاء الشرطة العسكرية حالياً، حاول مرة ثانية بعد شوي" });
-    if (!ids.includes(req.params.discord)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء الشرطة العسكرية" });
-    const { text, image } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
-    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)" });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `على ${p.registeredName || p.discord}` });
-    res.json({ ok: true, notes: p.notes });
-});
-// تقارير الشرطة العسكرية بنظر مسؤول الأفراد — تستثني تقارير القائد والنائب
-app.get("/api/mp/po/reports/pending", ensureMPPersonnelOfficer, async (req, res) => {
-    const settings = req.settings;
-    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
-    const list = await MPReport.find({ status: "pending", reporterDiscord: { $nin: excludeIds } }).sort({ createdAt: -1 }).limit(200);
-    res.json({ list });
-});
-app.post("/api/mp/po/reports/:id/approve", ensureMPPersonnelOfficer, async (req, res) => {
-    const settings = req.settings;
-    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
-    const r = await MPReport.findById(req.params.id);
-    if (!r || r.status !== "pending" || excludeIds.includes(r.reporterDiscord)) return res.status(404).json({ error: "غير موجود" });
-    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
-    await r.save();
-    const mpPr3 = await applyOrQueuePoints({
-        discordId: r.reporterDiscord, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
-        source: "mp-report", reason: `قبول تقرير شرطة عسكرية — ${r.reporterName || r.reporterTag}`,
-    });
-    if (mpPr3.applied) await checkAutoPromotion(r.reporterDiscord);
-    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة${mpPr3.queued ? " (بانتظار موافقة الإدارة)" : ""}` });
-    res.json({ ok: true });
-});
-app.post("/api/mp/po/reports/:id/reject", ensureMPPersonnelOfficer, async (req, res) => {
-    const { reason } = req.body;
-    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
-    const settings = req.settings;
-    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
-    const r = await MPReport.findById(req.params.id);
-    if (!r || r.status !== "pending" || excludeIds.includes(r.reporterDiscord)) return res.status(404).json({ error: "غير موجود" });
-    r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
-    await r.save();
-    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $push: { warnings: { kind: "notice", reason: "تم رفض تقريرك — انتبه المرة الجاية. السبب: " + reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username } } });
-    await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: reason.trim() });
-    res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -4482,12 +3513,12 @@ document.addEventListener('click', function (e) {
 }, true);
 
 // كل الأزرار اللي تستدعي api() توقف فورًا (تعتيم + تعطيل) لحظة الضغط وترجع بعد الرد —
-// يمنع إحساس "تعليق" الزر ويمنع إرسال نفس الطلب مرتين لو ضغط المستخدم أكثر من مرة
+// يمنع إحساس "تعليق" الزر ويمنع إرسال نفس الطلب مرتين لو ضغط المستخدم أكثر من مرة.
+// ملاحظة: ما نرفض الطلب لو الزر "busy" — لأن تعطيل الزر (disabled) نفسه كافي يمنع الضغط المكرر،
+// ورفض الطلب بناءً على متغيّر عالمي واحد كان يسبب تعليق كل طلبات الموقع لو طلب واحد بس علّق أو فشل بصمت.
 async function api(url, opts) {
-    const btn = __lastClickedBtn;
+    const btn = (__lastClickedBtn && __lastClickedBtn.isConnected) ? __lastClickedBtn : null;
     if (btn) {
-        if (btn.dataset.busy === '1') throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
-        btn.dataset.busy = '1';
         btn.dataset.prevOpacity = btn.style.opacity || '';
         btn.disabled = true;
         btn.style.opacity = '0.55';
@@ -4500,7 +3531,6 @@ async function api(url, opts) {
         return data;
     } finally {
         if (btn) {
-            btn.dataset.busy = '0';
             btn.disabled = false;
             btn.style.opacity = btn.dataset.prevOpacity || '';
             btn.style.cursor = '';
@@ -5443,7 +4473,6 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
-            <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
@@ -5976,7 +5005,6 @@ function renderSectorPanel() {
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>🎖️ قيادة \${ME.sectorInfo.sectorLabel} (\${ME.sectorInfo.role === 'commander' ? 'قائد' : 'نائب'})</h2>
             <div class="row" style="gap:8px;">
-                <button class="btn sm" style="background:#78350f;color:#fff;" onclick="openSectorNoticeForm()">📢 إشعار لأفراد القطاع</button>
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
         </div>
@@ -6232,7 +5260,6 @@ async function loadSectorMembers() {
                     <button class="btn sm gray" onclick="sectorAssignUnit('\${p.discord}')">🪖 يونت</button>
                     <button class="btn sm gray" onclick="editMemberPoints('\${p.discord}', \${p.points})">✏️ النقاط</button>
                     <button class="btn sm gray" onclick="sectorAddNote('\${p.discord}')">📝 ملاحظة</button>
-                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/sector/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
         </div>\`).join('');
@@ -6393,7 +5420,6 @@ async function loadPoMembers() {
                     <button class="btn sm gray" onclick="poPromotionRequest('\${p.discord}','down')">⬇️ طلب تنزيل</button>
                     <button class="btn sm gray" onclick="editMemberPoints('\${p.discord}', \${p.points})">✏️ النقاط</button>
                     <button class="btn sm gray" onclick="poAddNote('\${p.discord}')">📝 ملاحظة</button>
-                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/personnel-officer/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
         </div>\`).join('');
@@ -6473,7 +5499,6 @@ function renderMPPanel() {
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? (' (' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : ''}</h2>
             <div class="row" style="gap:8px;">
-                <button class="btn sm" style="background:#78350f;color:#fff;" onclick="openMPNoticeForm()">📢 إشعار لأفراد الشرطة العسكرية</button>
                 <button class="btn sm" onclick="openMPReportForm('renderMPPanel()')">+ تسجيل تقرير جديد</button>
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
@@ -6528,7 +5553,6 @@ async function loadMPForceMembers() {
                 <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPForceMembers()')">📝 ملاحظة</button>
-                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
         </div>\`).join('');
@@ -6587,7 +5611,6 @@ function renderMPLeaderMembersList(list) {
                 </div>
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
-                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
                     \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
                 </div>
@@ -7374,10 +6397,23 @@ async function loadLog(silent) {
     if (list[0]) lastLogId = list[0]._id;
     allLogsData = list;
     if (!document.getElementById('log-search')) {
-        box.innerHTML = \`<div class="card"><input id="log-search" placeholder="🔍 ابحث بالاسم، اليوزر، الآيدي، أو نوع الحدث..." oninput="filterLog()" style="margin-bottom:12px;"><div id="log-list"></div></div>\`;
+        box.innerHTML = \`<div class="card"><div class="row" style="gap:8px;align-items:center;">
+            <input id="log-search" placeholder="🔍 ابحث بالاسم، اليوزر، الآيدي، أو نوع الحدث..." oninput="filterLog()" style="flex:1;">
+            <button class="btn danger sm" onclick="wipeLog()">🗑️ مسح اللوق القديم بالكامل</button>
+        </div><div id="log-list" style="margin-top:12px;"></div></div>\`;
     }
     const q = (document.getElementById('log-search') || {}).value || '';
     renderLog(q.trim() ? filterLogsData(q) : list);
+}
+async function wipeLog() {
+    if (!confirm('⚠️ متأكد تبي تمسح كل سجلات اللوق الشامل القديمة نهائياً؟ ما ترجع بعد الحذف.')) return;
+    if (!confirm('تأكيد أخير — هذا الإجراء نهائي ولا يمكن التراجع عنه.')) return;
+    try {
+        const { deleted } = await api('/api/senior/log/wipe', { method: 'POST' });
+        toast(\`تم حذف \${deleted} سجل\`);
+        lastLogId = null;
+        loadLog();
+    } catch (e) { toast(e.message); }
 }
 function filterLogsData(q) {
     q = q.trim().toLowerCase();
