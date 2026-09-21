@@ -821,7 +821,9 @@ async function startBot() {
     botStoppedManually = false;
     try {
         await client.login(CONFIG.BOT_TOKEN);
-        return { ok: true };
+        // login يرجع قبل ما يجي حدث ready — ننتظره (حد أقصى 20 ثانية) عشان الموقع يعرض الحالة الصح
+        for (let i = 0; i < 40 && !botReady; i++) await new Promise(r => setTimeout(r, 500));
+        return { ok: true, online: botReady };
     } catch (e) {
         console.log("❌ فشل تسجيل دخول البوت:", e.message);
         return { ok: false, error: e.message };
@@ -6747,7 +6749,7 @@ function renderRoster() {
             + '<div class="row" style="gap:6px;margin-top:8px;">'
             + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
             + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
-            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
+            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\', this)">⭐ نقاط</button>'
             + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button>'
             + '<button class="btn sm gray" onclick="psSyncRole(\\'' + p.discord + '\\')">🔄 تحديث الرتبة</button></div>';
         if (isSenior) {
@@ -6808,7 +6810,7 @@ async function runPersonnelSearch() {
             + '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px;">'
             + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
             + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
-            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
+            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\', this)">⭐ نقاط</button>'
             + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button>'
             + '<button class="btn sm gray" onclick="psSyncRole(\\'' + p.discord + '\\')">🔄 تحديث الرتبة</button></div>'
             + (isSenior ? '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;"><select id="rk-' + p.discord + '" style="margin-bottom:0;flex:1;">'
@@ -6825,8 +6827,9 @@ async function psAction(discord, direction) {
         refreshPersonnelViews();
     } catch (e) { toast(e.message); }
 }
-function psPoints(discord) {
-    const card = document.getElementById('psr-' + discord);
+function psPoints(discord, btn) {
+    // الزر موجود بقائمة الرتب (prow-) وبنتائج البحث (psr-) — نلقى البطاقة من الزر نفسه
+    const card = (btn && btn.closest && btn.closest('.card')) || document.getElementById('psr-' + discord) || document.getElementById('prow-' + discord);
     if (!card || document.getElementById('pp-form-' + discord)) return;
     const form = document.createElement('div');
     form.id = 'pp-form-' + discord;
@@ -6843,12 +6846,12 @@ function psPoints(discord) {
         + '<button type="button" class="btn sm gray" onclick="ppCancel(\\'' + discord + '\\')">إلغاء</button>'
         + '</div>';
     card.appendChild(form);
-    card.dataset.ppType = 'inc';
+    form.dataset.ppType = 'inc';
     ppSetType(discord, 'inc');
 }
 function ppSetType(discord, type) {
-    const card = document.getElementById('psr-' + discord);
-    if (card) card.dataset.ppType = type;
+    const form = document.getElementById('pp-form-' + discord);
+    if (form) form.dataset.ppType = type;
     const incBtn = document.getElementById('pp-inc-' + discord);
     const decBtn = document.getElementById('pp-dec-' + discord);
     if (incBtn) incBtn.className = 'btn sm' + (type === 'inc' ? '' : ' gray');
@@ -6859,8 +6862,8 @@ function ppCancel(discord) {
     if (form) form.remove();
 }
 function ppSubmit(discord) {
-    const card = document.getElementById('psr-' + discord);
-    const type = (card && card.dataset.ppType) || 'inc';
+    const form = document.getElementById('pp-form-' + discord);
+    const type = (form && form.dataset.ppType) || 'inc';
     const amountEl = document.getElementById('pp-amount-' + discord);
     const amount = parseInt(amountEl.value, 10);
     if (!amount || amount <= 0) return toast('اكتب عدد نقاط صحيح');
@@ -7379,12 +7382,14 @@ async function toggleBot() {
     const btn = document.getElementById('bot-toggle-btn');
     if (btn) btn.disabled = true;
     try {
-        await api('/api/bot/toggle', { method: 'POST' });
-        toast('تم تنفيذ الأمر');
+        const r = await api('/api/bot/toggle', { method: 'POST' });
+        if (r && r.ok === false) toast(r.error || 'تعذر تنفيذ الأمر');
+        else toast('تم تنفيذ الأمر');
     } catch (e) {
         toast(e.message);
     }
-    loadBotControl();
+    await loadBotControl();
+    setTimeout(loadBotControl, 3000); // تحديث ثاني احتياطي لو ديسكورد تأخر بالاتصال
 }
 // ── إضافة/إزالة كبار المسؤولين من الموقع مباشرة (لصاحب صلاحية التحكم بالبوت فقط) ──
 async function loadSeniorAdmins() {
