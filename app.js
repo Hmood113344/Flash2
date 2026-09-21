@@ -23,6 +23,7 @@ const {
     TextInputBuilder,
     TextInputStyle,
     UserSelectMenuBuilder,
+    StringSelectMenuBuilder,
     AttachmentBuilder,
 } = require("discord.js");
 
