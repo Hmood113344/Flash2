@@ -1175,7 +1175,7 @@ async function handleCommandCommand(interaction) {
     const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
         "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار، ونقاط الاستلام (تختار الشخص اللي تعطيه).\n\n" +
         `**الرتبة المطلوبة لأغلب الأزرار:** ${settings.commandPermissions.command} فما فوق\n` +
-        "**قادة ونواب القطاعات:** يستخدمون الأزرار على أفراد قطاعهم فقط.");
+        "**قادة ونواب القطاعات:** يستخدمون الأزرار على أفراد قطاعهم فقط، وزر «حضور القطاع» يعرض لهم مين داخل ومين خارج ووقت الدخول والخروج.");
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ ترقية/تنزيل").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("cmd_warn_start").setLabel("⚠️ تحذير").setStyle(ButtonStyle.Danger),
@@ -1185,6 +1185,7 @@ async function handleCommandCommand(interaction) {
     );
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("cmd_reception").setLabel(`🪖 نقاط الاستلام (+${CONFIG.RECEPTION_POINTS})`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("cmd_att_view").setLabel("📋 حضور القطاع").setStyle(ButtonStyle.Secondary),
     );
     await interaction.editReply({ embeds: [embed], components: [row1, row2] });
 }
@@ -1242,39 +1243,33 @@ async function finishReception(interaction, session, targetId) {
     await interaction.editReply({ content: `✅ تم إضافة ${CONFIG.RECEPTION_POINTS} نقاط استلام لـ<@${targetId}> (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم).`, components: [] });
 }
 async function handleCommandTargetSelect(interaction) {
-    await interaction.deferUpdate();
     const session = cmdSessions.get(interaction.user.id);
-    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
+    // الأزرار اللي تفتح نموذج (Modal) لازم ما نرد على التفاعل قبل فتحه، وإلا ديسكورد يرفض فتح النموذج ويطلع "فشل التفاعل"
+    const modalActions = ["warn", "notice", "note", "points"];
+    if (!session || !modalActions.includes(session.action)) await interaction.deferUpdate();
+    const reply = (payload) => (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
+    if (!session) return reply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     const targetId = interaction.values[0];
     // نقاط الاستلام يمديك تعطيها لنفسك أو لغيرك (ضمن الحد اليومي)، أما بقية الأزرار فما تقدر تختار نفسك
     if (session.action !== "reception" && targetId === interaction.user.id) {
         cmdSessions.delete(interaction.user.id);
-        return interaction.editReply({ content: "🚫 ما تقدر تختار نفسك.", components: [] });
+        return reply({ content: "🚫 ما تقدر تختار نفسك.", components: [] });
     }
     if (interaction.users?.get(targetId)?.bot) {
         cmdSessions.delete(interaction.user.id);
-        return interaction.editReply({ content: "🚫 ما تقدر تختار بوت.", components: [] });
+        return reply({ content: "🚫 ما تقدر تختار بوت.", components: [] });
     }
     // قائد/نائب القطاع (اللي صلاحيته جاية من منصبه مو من رتبته) يتحكم بأفراد قطاعه فقط
     if (session.leaderSector) {
         const inSector = await targetInSector(targetId, session.leaderSector, await getSettings());
         if (!inSector) {
             cmdSessions.delete(interaction.user.id);
-            return interaction.editReply({ content: `🚫 صلاحيتك على أفراد ${CONFIG.SECTORS[session.leaderSector]} فقط، والشخص المختار مو من قطاعك.`, components: [] });
+            return reply({ content: `🚫 صلاحيتك على أفراد ${CONFIG.SECTORS[session.leaderSector]} فقط، والشخص المختار مو من قطاعك.`, components: [] });
         }
     }
     if (session.action === "reception") return finishReception(interaction, session, targetId);
-    const target = await getOrCreatePersonnel(targetId, null);
     session.targetId = targetId;
-    session.targetRank = target.rank;
 
-    if (session.action === "promote") {
-        const idx = rankIndex(target.rank);
-        const row = new ActionRowBuilder();
-        if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
-        if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
-        return interaction.editReply({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
-    }
     if (session.action === "warn" || session.action === "notice") {
         const modal = new ModalBuilder().setCustomId("cmd_warnnotice_modal").setTitle(session.action === "warn" ? "سبب التحذير" : "نص الإشعار");
         const input = new TextInputBuilder().setCustomId("reason").setLabel("اكتب النص").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
@@ -1294,6 +1289,82 @@ async function handleCommandTargetSelect(interaction) {
         modal.addComponents(new ActionRowBuilder().addComponents(amountInput), new ActionRowBuilder().addComponents(reasonInput));
         return interaction.showModal(modal);
     }
+    if (session.action === "promote") {
+        const target = await getOrCreatePersonnel(targetId, null);
+        session.targetRank = target.rank;
+        const idx = rankIndex(target.rank);
+        const row = new ActionRowBuilder();
+        if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
+        if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
+        return reply({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
+    }
+    // إجراء غير معروف — ننهي الجلسة بدل ما نخلي التفاعل معلّق
+    cmdSessions.delete(interaction.user.id);
+    return reply({ content: "❌ إجراء غير معروف، ابدأ من جديد.", components: [] });
+}
+
+// ── عرض حضور القطاع لقائد/نائب القطاع (مين داخل ومين خارج ومتى سجّل دخول وخروج) ──
+async function sendSectorAttendance(interaction, sectorKey) {
+    const settings = await getSettings();
+    const label = CONFIG.SECTORS[sectorKey];
+    const roleId = sectorRoleId(sectorKey, settings);
+    if (!roleId || !botReady) return interaction.editReply({ content: "❌ ما قدرت أجلب أعضاء القطاع الحين، حاول بعد شوي.", components: [] });
+    let members;
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const role = await guild.roles.fetch(roleId);
+        if (!role) return interaction.editReply({ content: `❌ رول ${label} غير موجود بالسيرفر — تأكد من آيدي الرول بإعدادات الكبار.`, components: [] });
+        await ensureGuildMembersFetched(guild);
+        members = role.members.filter(m => !m.user.bot).map(m => ({ id: m.id, name: m.displayName }));
+    } catch (e) {
+        return interaction.editReply({ content: "❌ تعذر جلب أعضاء القطاع من ديسكورد، حاول بعد شوي.", components: [] });
+    }
+    if (!members.length) return interaction.editReply({ content: `ما فيه أعضاء معهم رول ${label} حالياً.`, components: [] });
+    const statuses = await AttendanceStatus.find({ discord: { $in: members.map(m => m.id) } });
+    const byId = new Map(statuses.map(st => [st.discord, st]));
+    const rows = members.map(m => ({ name: (byId.get(m.id)?.registeredName) || m.name, st: byId.get(m.id) || null }));
+    const group = r => !r.st || (!r.st.lastCheckInAt && !r.st.lastCheckOutAt) ? 2 : (r.st.status === "in" ? 0 : 1);
+    rows.sort((x, y) => group(x) - group(y) || x.name.localeCompare(y.name, "ar"));
+    const ts = d => d ? `<t:${Math.floor(new Date(d).getTime() / 1000)}:f>` : "—";
+    const counts = [0, 0, 0];
+    const lines = rows.map(r => {
+        const g = group(r); counts[g]++;
+        if (g === 2) return `⚪ **${r.name}** — ما سجّل حضور قط`;
+        return `${g === 0 ? "🟢" : "🔴"} **${r.name}** — ${g === 0 ? "داخل" : "خارج"}\n↳ دخول: ${ts(r.st.lastCheckInAt)} • خروج: ${ts(r.st.lastCheckOutAt)}`;
+    });
+    // نقسم القائمة على أكثر من إيمبد (حد الوصف 4096 حرف)
+    const embeds = []; let cur = "";
+    for (const line of lines) {
+        if ((cur + "\n\n" + line).length > 3800) { embeds.push(cur); cur = line; }
+        else cur = cur ? cur + "\n\n" + line : line;
+    }
+    if (cur) embeds.push(cur);
+    const shown = embeds.slice(0, 10);
+    const out = shown.map((desc, i) => {
+        const e = brandEmbed().setDescription(desc);
+        if (i === 0) e.setTitle(`📋 حضور ${label}`).setAuthor({ name: `🟢 ${counts[0]} داخل  •  🔴 ${counts[1]} خارج  •  ⚪ ${counts[2]} ما سجّلوا` });
+        return e;
+    });
+    await interaction.editReply({ content: embeds.length > 10 ? "⚠️ القائمة طويلة، انعرض جزء منها فقط." : "", embeds: out, components: [] });
+}
+async function handleCommandAttendanceView(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const settings = await getSettings();
+    const leader = getSectorLeaderInfo(interaction.user.id, settings);
+    if (leader) return sendSectorAttendance(interaction, leader.sector);
+    if (isSeniorAdmin(interaction.user.id)) {
+        const menu = new StringSelectMenuBuilder().setCustomId("cmd_att_sector_select").setPlaceholder("اختر القطاع")
+            .addOptions(Object.entries(CONFIG.SECTORS).map(([k, v]) => ({ label: v, value: k })));
+        return interaction.editReply({ content: "**اختر القطاع اللي تبي تشوف حضوره:**", components: [new ActionRowBuilder().addComponents(menu)] });
+    }
+    return interaction.editReply({ content: "🚫 هذا الزر لقادة ونواب القطاعات فقط." });
+}
+async function handleCommandAttendanceSectorSelect(interaction) {
+    await interaction.deferUpdate();
+    if (!isSeniorAdmin(interaction.user.id)) return interaction.editReply({ content: "🚫 ما عندك صلاحية.", components: [] });
+    const key = interaction.values[0];
+    if (!CONFIG.SECTORS[key]) return interaction.editReply({ content: "❌ قطاع غير صحيح.", components: [] });
+    return sendSectorAttendance(interaction, key);
 }
 async function handleCommandDirectionButton(interaction) {
     const session = cmdSessions.get(interaction.user.id);
@@ -1639,6 +1710,7 @@ client.on("interactionCreate", async interaction => {
                 cmd_points_start: handleCommandPointsStart,
                 cmd_notice_start: handleCommandNoticeStart,
                 cmd_reception: handleCommandReceptionButton,
+                cmd_att_view: handleCommandAttendanceView,
                 cmd_dir_up: handleCommandDirectionButton,
                 cmd_dir_down: handleCommandDirectionButton,
                 leave_start: handleLeaveStart,
@@ -1656,6 +1728,7 @@ client.on("interactionCreate", async interaction => {
         if (interaction.isStringSelectMenu()) {
             if (interaction.customId === "viol_types_select") { await handleViolationTypesSelect(interaction); return; }
             if (interaction.customId === "viol_vehicle_select") { await handleViolationVehicleSelect(interaction); return; }
+            if (interaction.customId === "cmd_att_sector_select") { await handleCommandAttendanceSectorSelect(interaction); return; }
             return;
         }
         if (interaction.isUserSelectMenu()) {
