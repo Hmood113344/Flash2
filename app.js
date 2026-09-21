@@ -189,6 +189,23 @@ const PersonnelSchema = new mongoose.Schema({
     leaveBalance: { type: Number, default: 10 }, // رصيد الإجازات المتبقي بالأيام
     createdAt: { type: Date, default: Date.now }
 });
+// ── تحديث رول الرتبة بديسكورد تلقائياً وإجبارياً عند أي ترقية/تنزيل (من الموقع أو البوت أو النظام التلقائي) ──
+PersonnelSchema.pre("save", async function () {
+    this.$locals.rankChanged = !this.isNew && this.isModified("rank");
+});
+PersonnelSchema.post("save", function (doc) {
+    if (doc.$locals && doc.$locals.rankChanged) {
+        doc.$locals.rankChanged = false;
+        if (!doc.$locals.skipRankSync) doc.$locals.rankSync = runRankRoleSync(doc.discord);
+    }
+});
+PersonnelSchema.pre("findOneAndUpdate", async function () {
+    const u = this.getUpdate() || {};
+    this._rankChanging = u.rank !== undefined || (u.$set && u.$set.rank !== undefined);
+});
+PersonnelSchema.post("findOneAndUpdate", function (doc) {
+    if (this._rankChanging && doc && doc.$locals) doc.$locals.rankSync = runRankRoleSync(doc.discord);
+});
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
 
 const ViolationSchema = new mongoose.Schema({
@@ -782,6 +799,64 @@ async function isMilitary(discordId) {
         console.error("❌ isMilitary خطأ:", e.message);
         return { ok: false, reason: e.message };
     }
+}
+
+// يطبّق رتبة الشخص المسجّلة بالنظام على رولات ديسكورد: يعطيه رول رتبته ويشيل رولات باقي الرتب العسكرية
+async function syncDiscordRankRole(discordId, rank, settings) {
+    settings = settings || await getSettings();
+    const map = settings.rankRoleIds;
+    const getRole = r => (map ? (typeof map.get === "function" ? map.get(r) : map[r]) : null);
+    const allRoleIds = CONFIG.MILITARY_RANKS.map(getRole).filter(Boolean);
+    if (!allRoleIds.length) return { ok: false, reason: "ما فيه آيديات رتب مضبوطة بإعدادات الكبار" };
+    if (!botReady) return { ok: false, reason: "البوت غير متصل بديسكورد حالياً" };
+    const newRoleId = getRole(rank);
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const member = await guild.members.fetch(discordId);
+        let added = false, removed = 0;
+        // نعطيه الرول الجديد أول، وبعدها نشيل القديم — عشان ما يبقى بدون رتبة لو صار خطأ بالنص
+        if (newRoleId && !member.roles.cache.has(newRoleId)) { await member.roles.add(newRoleId, "تحديث رتبة عسكرية"); added = true; }
+        const toRemove = allRoleIds.filter(id => id !== newRoleId && member.roles.cache.has(id));
+        if (toRemove.length) { await member.roles.remove(toRemove, "تحديث رتبة عسكرية"); removed = toRemove.length; }
+        if (!newRoleId) return { ok: false, reason: `ما فيه آيدي رول مضبوط لرتبة «${rank}» بالإعدادات`, added, removed };
+        return { ok: true, added, removed };
+    } catch (e) {
+        let reason = e.message;
+        if (e.code === 10007 || e.code === 10013) reason = "الشخص مو موجود بالسيرفر";
+        else if (e.code === 50013) reason = "رول البوت أقل من رولات الرتب — ارفع رول البوت فوقها بإعدادات السيرفر";
+        else if (e.code === 10011) reason = "أحد آيديات الرتب غير موجود بالسيرفر — تأكد منها بالإعدادات";
+        return { ok: false, reason };
+    }
+}
+// تنفيذ مرتب لكل شخص (عشان ما يتخبطون طلبين بنفس الوقت) — يطبّق دايماً آخر رتبة محفوظة بقاعدة البيانات، ولا يرمي خطأ أبداً
+const rankSyncQueue = new Map();
+function runRankRoleSync(discordId) {
+    const prev = rankSyncQueue.get(discordId) || Promise.resolve();
+    const job = prev.catch(() => {}).then(async () => {
+        try {
+            const doc = await Personnel.findOne({ discord: discordId }).select("rank discordTag");
+            if (!doc) return { ok: false, reason: "الشخص غير موجود بالنظام" };
+            const r = await syncDiscordRankRole(discordId, doc.rank);
+            if (!r.ok) {
+                await logEvent({ action: "فشل تحديث رول الرتبة", discordId, discordTag: doc.discordTag, actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي", details: `${doc.rank}: ${r.reason}` });
+                console.error(`⚠️ فشل تحديث رول الرتبة (${discordId}):`, r.reason);
+            } else if (r.added || r.removed) {
+                await logEvent({ action: "تحديث رول الرتبة", discordId, discordTag: doc.discordTag, actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي", details: `${doc.rank} (أُضيف: ${r.added ? "نعم" : "لا"}، أُزيل: ${r.removed})` });
+            }
+            return r;
+        } catch (e) {
+            console.error("❌ runRankRoleSync:", e.message);
+            return { ok: false, reason: e.message };
+        }
+    });
+    rankSyncQueue.set(discordId, job);
+    job.finally(() => { if (rankSyncQueue.get(discordId) === job) rankSyncQueue.delete(discordId); });
+    return job;
+}
+async function awaitRankSync(p, changed) {
+    if (!changed || !p) return null;
+    if (p.$locals && p.$locals.rankSync) return p.$locals.rankSync;
+    return runRankRoleSync(p.discord);
 }
 
 // يفحص رولات ديسكورد الشخص مقابل خريطة settings.rankRoleIds (تعبّيها كبار المسؤولين من الإعدادات)
@@ -2113,6 +2188,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     if (detectedRank && detectedRank !== p.rank) {
         const oldRank = p.rank;
         p.rank = detectedRank;
+        p.$locals.skipRankSync = true; // الرتبة جاية أصلاً من رول ديسكورد، ما نرجّعها له
         await p.save();
         await logEvent({ action: "مزامنة رتبة تلقائية من الرول", discordId: p.discord, discordTag: p.discordTag, actorId: "system", actorTag: "النظام", details: `${oldRank || "-"} ← ${detectedRank} (حسب رول الديسكورد)` });
     }
@@ -2526,9 +2602,18 @@ app.post("/api/admin/personnel/:discord/rank-direct", ensureAnyAdmin, async (req
     p.rank = CONFIG.MILITARY_RANKS[newIdx];
     p.points = 0;
     await p.save();
+    const roleSync = await awaitRankSync(p, true);
     await logEvent({ action: direction === "up" ? "ترقية مباشرة (بحث الأفراد)" : "تنزيل مباشر (بحث الأفراد)", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${fromRank} ← ${p.rank}` });
     dmMember(p.discord, new EmbedBuilder().setTitle(direction === "up" ? "⬆️ تمت ترقيتك" : "⬇️ تم تنزيل رتبتك").setColor(direction === "up" ? 0x22c55e : 0xef4444).addFields({ name: "الرتبة الجديدة", value: p.rank }).setTimestamp()).catch(() => {});
-    res.json({ ok: true, personnel: p });
+    res.json({ ok: true, personnel: p, roleSync });
+});
+// تحديث رول الرتبة بديسكورد يدوياً — يطبّق رتبة الشخص المسجّلة بالنظام على رولاته
+app.post("/api/admin/personnel/:discord/sync-rank-role", ensureAnyAdmin, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord }).select("discord rank discordTag");
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const roleSync = await runRankRoleSync(p.discord);
+    await logEvent({ action: "تحديث رتبة يدوي (قائمة الأفراد)", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${p.rank} — ${roleSync.ok ? "تم" : "فشل: " + roleSync.reason}` });
+    res.json({ ok: true, rank: p.rank, roleSync });
 });
 app.post("/api/admin/personnel/:discord/points-direct", ensureAnyAdmin, async (req, res) => {
     const { delta, reason } = req.body;
@@ -2924,7 +3009,8 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "تعديل ملف عسكري", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(update) });
     await checkAutoPromotion(req.params.discord);
-    res.json({ ok: true, personnel: p });
+    const roleSync = await awaitRankSync(p, update.rank !== undefined);
+    res.json({ ok: true, personnel: p, roleSync });
 });
 
 // ── تعديل نقاط الأعضاء — متاح لكبار المسؤولين، قادة/نواب القطاعات، ومسؤول الأفراد (بنطاق صلاحيته) ──
@@ -6581,7 +6667,8 @@ function renderRoster() {
             + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
             + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
             + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
-            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button></div>';
+            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button>'
+            + '<button class="btn sm gray" onclick="psSyncRole(\\'' + p.discord + '\\')">🔄 تحديث الرتبة</button></div>';
         if (isSenior) {
             html += '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;">'
                 + '<select id="rk-' + p.discord + '" style="margin-bottom:0;flex:1;">'
@@ -6592,13 +6679,24 @@ function renderRoster() {
     });
     rbox.innerHTML = html;
 }
+function roleSyncNote(res, base) {
+    var rs = res && res.roleSync;
+    if (!rs) return base;
+    return rs.ok ? base + ' ✅ وتحدّث رول الرتبة بديسكورد' : base + ' ⚠️ لكن رول ديسكورد ما تحدّث: ' + rs.reason;
+}
+async function psSyncRole(discord) {
+    try {
+        var r = await api('/api/admin/personnel/' + discord + '/sync-rank-role', { method: 'POST' });
+        toast(roleSyncNote(r, 'رتبته: ' + r.rank + ' —').replace('— ✅', '—'));
+    } catch (e) { toast(e.message); }
+}
 async function psSetRank(discord) {
     var sel = document.getElementById('rk-' + discord);
     if (!sel) return;
     if (!confirm('تأكيد تغيير الرتبة إلى: ' + sel.value + '؟')) return;
     try {
-        await api('/api/senior/personnel/' + discord + '/update', { method: 'POST', body: JSON.stringify({ rank: sel.value }) });
-        toast('تم تغيير الرتبة');
+        var ur = await api('/api/senior/personnel/' + discord + '/update', { method: 'POST', body: JSON.stringify({ rank: sel.value }) });
+        toast(roleSyncNote(ur, 'تم تغيير الرتبة'));
         refreshPersonnelViews();
     } catch (e) { toast(e.message); }
 }
@@ -6630,7 +6728,8 @@ async function runPersonnelSearch() {
             + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
             + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
             + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
-            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button></div>'
+            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button>'
+            + '<button class="btn sm gray" onclick="psSyncRole(\\'' + p.discord + '\\')">🔄 تحديث الرتبة</button></div>'
             + (isSenior ? '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;"><select id="rk-' + p.discord + '" style="margin-bottom:0;flex:1;">'
                 + MILITARY_RANKS.slice().reverse().map(function (r) { return '<option' + (r === p.rank ? ' selected' : '') + '>' + escH(r) + '</option>'; }).join('')
                 + '</select><button class="btn sm gray" onclick="psSetRank(\\'' + p.discord + '\\')">تعيين الرتبة</button></div>' : '')
@@ -6640,8 +6739,8 @@ async function runPersonnelSearch() {
 async function psAction(discord, direction) {
     if (!confirm(direction === 'up' ? 'تأكيد الترقية؟' : 'تأكيد التنزيل؟')) return;
     try {
-        const { personnel } = await api('/api/admin/personnel/' + discord + '/rank-direct', { method: 'POST', body: JSON.stringify({ direction }) });
-        toast('تم');
+        const rd = await api('/api/admin/personnel/' + discord + '/rank-direct', { method: 'POST', body: JSON.stringify({ direction }) });
+        toast(roleSyncNote(rd, 'تم'));
         refreshPersonnelViews();
     } catch (e) { toast(e.message); }
 }
