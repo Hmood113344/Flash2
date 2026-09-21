@@ -6833,14 +6833,14 @@ function psPoints(discord) {
     form.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.12);';
     form.innerHTML = ''
         + '<div class="row" style="gap:6px;">'
-        + '<button type="button" class="btn sm" id="pp-inc-' + discord + '" onclick="ppSetType(\'' + discord + '\',\'inc\')">➕ زيادة</button>'
-        + '<button type="button" class="btn sm gray" id="pp-dec-' + discord + '" onclick="ppSetType(\'' + discord + '\',\'dec\')">➖ نقص</button>'
+        + '<button type="button" class="btn sm" id="pp-inc-' + discord + '" onclick="ppSetType(\\'' + discord + '\\',\\'inc\\')">➕ زيادة</button>'
+        + '<button type="button" class="btn sm gray" id="pp-dec-' + discord + '" onclick="ppSetType(\\'' + discord + '\\',\\'dec\\')">➖ نقص</button>'
         + '</div>'
         + '<input id="pp-amount-' + discord + '" type="number" min="1" inputmode="numeric" placeholder="عدد النقاط" style="margin-top:8px;">'
         + '<input id="pp-reason-' + discord + '" placeholder="السبب (اختياري)" style="margin-top:8px;">'
         + '<div class="row" style="gap:6px;margin-top:8px;">'
-        + '<button type="button" class="btn sm" onclick="ppSubmit(\'' + discord + '\')">تأكيد</button>'
-        + '<button type="button" class="btn sm gray" onclick="ppCancel(\'' + discord + '\')">إلغاء</button>'
+        + '<button type="button" class="btn sm" onclick="ppSubmit(\\'' + discord + '\\')">تأكيد</button>'
+        + '<button type="button" class="btn sm gray" onclick="ppCancel(\\'' + discord + '\\')">إلغاء</button>'
         + '</div>';
     card.appendChild(form);
     card.dataset.ppType = 'inc';
