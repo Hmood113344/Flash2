@@ -524,11 +524,11 @@ async function isAnyAdmin(userId) {
 
 // يطبّق تغيير نقاط فوراً لو الفاعل إداري (كبير مسؤول أو من قائمة الإدارة)، وإلا يحط طلب معلّق بانتظار موافقة أي إداري.
 // لو الفاعل يحاول يعطي نفسه نقاط (وهو مو إداري) نرفض العملية نهائياً بدل ما نحطها بالطلبات المعلّقة (استثناء: source === "reception" — نقاط الاستلام مسموحة للنفس ضمن حدّها اليومي، وتُطبَّق مباشرة بدون طلب لأنها مقيّدة أصلاً).
-async function applyOrQueuePoints({ discordId, delta, reason, source, actorId, actorTag }) {
+async function applyOrQueuePoints({ discordId, delta, reason, source, actorId, actorTag, allowSelf = false }) {
     if (!delta) return { applied: false, skipped: true };
     const admin = await isAnyAdmin(actorId);
     // إداري يحاول يعطي نفسه نقاط بدون مراجعة من طرف ثاني — ممنوع نهائياً (إلا نقاط الاستلام المقيّدة أصلاً)
-    if (admin && source !== "reception" && discordId === actorId) {
+    if (admin && source !== "reception" && !allowSelf && discordId === actorId) {
         return { applied: false, blocked: true, error: "ما تقدر تعطي نفسك نقاط." };
     }
     if (admin || source === "reception") {
@@ -2467,8 +2467,53 @@ app.get("/api/admin/personnel/search", ensureAnyAdmin, async (req, res) => {
     const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(15);
     res.json({ list });
 });
+// قائمة أعضاء القطاعات — كل من معه رول أي قطاع من الإعدادات (دوريات / أمن الطرق / مكافحة المخدرات) مع رتبته ونقاطه
+app.get("/api/admin/personnel/sector-roster", ensureAnyAdmin, async (req, res) => {
+    if (!botReady) return res.status(503).json({ error: "البوت لسا ما اتصل بديسكورد، حاول بعد ثوانٍ" });
+    const settings = req.settings || await getSettings();
+    const members = new Map();
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        await ensureGuildMembersFetched(guild);
+        for (const key of Object.keys(CONFIG.SECTORS)) {
+            const roleId = sectorRoleId(key, settings);
+            if (!roleId) continue;
+            const role = await guild.roles.fetch(roleId);
+            if (!role) continue;
+            role.members.forEach(m => {
+                if (m.user.bot) return;
+                const e = members.get(m.id) || { discord: m.id, username: m.user.username, displayName: m.displayName, sectors: [] };
+                if (!e.sectors.includes(CONFIG.SECTORS[key])) e.sectors.push(CONFIG.SECTORS[key]);
+                members.set(m.id, e);
+            });
+        }
+    } catch (e) {
+        console.error("❌ فشل جلب قائمة أعضاء القطاعات:", e.message);
+        return res.status(503).json({ error: "تعذر جلب الأعضاء من ديسكورد حالياً، حاول بعد شوي" });
+    }
+    const ids = [...members.keys()];
+    const fields = "discord rank points unit registeredName discordTag isBlocked isDismissed";
+    let docs = await Personnel.find({ discord: { $in: ids } }).select(fields);
+    // اللي ما عندهم سجل بالنظام نسوي لهم سجل (رتبة جندي) عشان الكبار يقدرون يعدلون رتبهم ونقاطهم
+    const have = new Set(docs.map(d => d.discord));
+    const missing = ids.filter(id => !have.has(id)).map(id => ({ discord: id, discordTag: members.get(id).username, registeredName: members.get(id).displayName }));
+    if (missing.length) {
+        try { await Personnel.insertMany(missing, { ordered: false }); } catch (e) { /* تجاهل تكرار السجلات */ }
+        docs = await Personnel.find({ discord: { $in: ids } }).select(fields);
+    }
+    const byId = new Map(docs.map(d => [d.discord, d]));
+    const list = ids.map(id => {
+        const m = members.get(id); const d = byId.get(id);
+        return { discord: id, username: m.username, displayName: m.displayName, sectors: m.sectors,
+            name: (d && d.registeredName) || m.displayName, rank: d ? d.rank : "جندي", points: d ? d.points : 0,
+            unit: d ? d.unit : null, isBlocked: !!(d && d.isBlocked), isDismissed: !!(d && d.isDismissed) };
+    });
+    list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank) || b.points - a.points || a.name.localeCompare(b.name, "ar"));
+    res.json({ list, sectors: CONFIG.SECTORS });
+});
 app.post("/api/admin/personnel/:discord/rank-direct", ensureAnyAdmin, async (req, res) => {
-    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
+    // كبار المسؤولين يقدرون يرقّون/ينزّلون أنفسهم، أما بقية الإداريين فلا
+    if (req.params.discord === req.user.id && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
     const { direction } = req.body;
     if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
     const p = await Personnel.findOne({ discord: req.params.discord });
@@ -2488,7 +2533,7 @@ app.post("/api/admin/personnel/:discord/points-direct", ensureAnyAdmin, async (r
     const { delta, reason } = req.body;
     const d = parseInt(delta, 10);
     if (isNaN(d) || d === 0) return res.status(400).json({ error: "حط عدد نقاط صحيح" });
-    const pr = await applyOrQueuePoints({ discordId: req.params.discord, delta: d, actorId: req.user.id, actorTag: req.user.username, source: "manual", reason: (reason || "").trim() || "تعديل نقاط (بحث الأفراد)" });
+    const pr = await applyOrQueuePoints({ discordId: req.params.discord, delta: d, actorId: req.user.id, actorTag: req.user.username, source: "manual", reason: (reason || "").trim() || "تعديل نقاط (بحث الأفراد)", allowSelf: isSeniorAdmin(req.user.id) });
     if (pr.blocked) return res.status(403).json({ error: pr.error });
     if (!pr.applied) return res.status(500).json({ error: "تعذر تنفيذ العملية" });
     await checkAutoPromotion(req.params.discord);
@@ -6467,18 +6512,98 @@ async function loadAdminsList() {
 function fireAdmin(id) {
     api('/api/senior/fire-admin', { method: 'POST', body: JSON.stringify({ discordId: id }) }).then(() => { toast('تم الفصل'); loadHire(); });
 }
-// صفحة بحث الأفراد — بحث فقط (مو قائمة كاملة)، مع إجراءات فورية: ترقية/تنزيل/نقاط/تحذير
+// صفحة بحث الأفراد — قائمة أعضاء القطاعات (من فريق أول إلى جندي) + بحث بكل الحسابات، مع إجراءات فورية: ترقية/تنزيل/نقاط/تحذير، والكبار يختارون أي رتبة
 let personnelSearchTimer = null;
+let rosterData = [];
 async function loadPersonnelSearchPage() {
     const box = document.getElementById('admin-content');
     if (!box) return;
-    box.innerHTML = \`
-        <div class="card">
-            <h3>🔍 بحث الأفراد</h3>
-            <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">اكتب اسم أو يونت أو تاق ديسكورد (حرفين فأكثر) — ما تطلع القائمة كاملة، لازم تبحث عن الشخص.</p>
-            <input id="psearch-q" placeholder="ابحث..." oninput="onPersonnelSearchInput()">
-        </div>
-        <div id="psearch-results"></div>\`;
+    box.innerHTML = '<div class="card">'
+        + '<h3>🔍 أفراد القطاعات</h3>'
+        + '<p style="color:var(--muted);font-size:12px;margin-bottom:10px;">كل الأعضاء اللي معهم رول أي قطاع (حسب آيديات الرولات بالإعدادات) مرتبين من أعلى رتبة لأقل رتبة. اكتب بالخانة للتصفية بالاسم أو اليوزر أو الآيدي.</p>'
+        + '<input id="roster-q" placeholder="ابحث بالاسم / اليوزر / الآيدي..." oninput="renderRoster()">'
+        + '<select id="roster-sector" onchange="renderRoster()" style="margin-top:8px;"><option value="">كل القطاعات</option></select>'
+        + '</div>'
+        + '<div id="roster-box"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>'
+        + '<div class="card" style="margin-top:14px;"><h3>🔎 بحث بكل الحسابات</h3>'
+        + '<p style="color:var(--muted);font-size:12px;margin-bottom:10px;">لو الشخص ما معه رول قطاع — اكتب اسم أو يونت أو تاق (حرفين فأكثر).</p>'
+        + '<input id="psearch-q" placeholder="ابحث..." oninput="onPersonnelSearchInput()"></div>'
+        + '<div id="psearch-results"></div>';
+    loadRoster();
+}
+async function loadRoster() {
+    var rbox = document.getElementById('roster-box');
+    if (!rbox) return;
+    var data;
+    try { data = await api('/api/admin/personnel/sector-roster'); }
+    catch (e) {
+        if (currentAdminTab !== 'search') return;
+        rbox = document.getElementById('roster-box');
+        if (rbox) rbox.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + escH(e.message) + ')</div>';
+        return;
+    }
+    if (currentAdminTab !== 'search') return;
+    rosterData = data.list;
+    var sel = document.getElementById('roster-sector');
+    if (sel && sel.options.length <= 1) {
+        Object.keys(data.sectors).forEach(function (k) {
+            var o = document.createElement('option'); o.value = data.sectors[k]; o.textContent = data.sectors[k]; sel.appendChild(o);
+        });
+    }
+    renderRoster();
+}
+function renderRoster() {
+    var rbox = document.getElementById('roster-box');
+    if (!rbox) return;
+    var q = ((document.getElementById('roster-q') || {}).value || '').trim().toLowerCase();
+    var sec = (document.getElementById('roster-sector') || {}).value || '';
+    var list = rosterData.filter(function (p) {
+        if (sec && p.sectors.indexOf(sec) === -1) return false;
+        if (!q) return true;
+        return [p.name, p.displayName, p.username, p.discord, p.unit].some(function (v) { return (v || '').toString().toLowerCase().indexOf(q) !== -1; });
+    });
+    if (!list.length) { rbox.innerHTML = '<div class="card center" style="color:var(--muted);">لا نتائج</div>'; return; }
+    var isSenior = !!(ME && ME.isSeniorAdmin);
+    var html = '<div style="color:var(--muted);font-size:12px;margin:8px 4px;">العدد: ' + list.length + '</div>';
+    var lastRank = null;
+    list.forEach(function (p) {
+        if (p.rank !== lastRank) {
+            var cnt = list.filter(function (x) { return x.rank === p.rank; }).length;
+            html += '<h3 style="margin:14px 4px 4px;color:var(--gold-soft);">🎖️ ' + escH(p.rank) + ' <span style="color:var(--muted);font-size:12px;">(' + cnt + ')</span></h3>';
+            lastRank = p.rank;
+        }
+        html += '<div class="card" id="prow-' + p.discord + '" style="padding:10px 12px;margin-top:6px;">'
+            + '<div><b>' + escH(p.name) + '</b> <span style="color:var(--muted);font-size:12px;">@' + escH(p.username) + '</span>'
+            + (p.isBlocked ? ' <span style="color:#f87171;font-size:12px;">🚫 موقوف</span>' : '') + '</div>'
+            + '<div style="font-size:12px;color:var(--muted);margin:3px 0;">الآيدي: ' + p.discord + ' • ' + escH(p.sectors.join('، ')) + ' • النقاط: ' + p.points + '</div>'
+            + '<div class="row" style="gap:6px;margin-top:8px;">'
+            + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
+            + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
+            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
+            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button></div>';
+        if (isSenior) {
+            html += '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;">'
+                + '<select id="rk-' + p.discord + '" style="margin-bottom:0;flex:1;">'
+                + MILITARY_RANKS.slice().reverse().map(function (r) { return '<option' + (r === p.rank ? ' selected' : '') + '>' + escH(r) + '</option>'; }).join('')
+                + '</select><button class="btn sm gray" onclick="psSetRank(\\'' + p.discord + '\\')">تعيين الرتبة</button></div>';
+        }
+        html += '</div>';
+    });
+    rbox.innerHTML = html;
+}
+async function psSetRank(discord) {
+    var sel = document.getElementById('rk-' + discord);
+    if (!sel) return;
+    if (!confirm('تأكيد تغيير الرتبة إلى: ' + sel.value + '؟')) return;
+    try {
+        await api('/api/senior/personnel/' + discord + '/update', { method: 'POST', body: JSON.stringify({ rank: sel.value }) });
+        toast('تم تغيير الرتبة');
+        refreshPersonnelViews();
+    } catch (e) { toast(e.message); }
+}
+function refreshPersonnelViews() {
+    loadRoster();
+    if ((document.getElementById('psearch-q') || {}).value) runPersonnelSearch();
 }
 function onPersonnelSearchInput() {
     clearTimeout(personnelSearchTimer);
@@ -6489,30 +6614,34 @@ async function runPersonnelSearch() {
     const box = document.getElementById('psearch-results');
     if (!box) return;
     if (q.length < 2) { box.innerHTML = ''; return; }
-    box.innerHTML = '<div class="card center" style="color:var(--muted);">جارِ البحث...</div>';
+    box.innerHTML = '<div class=\"card center\" style=\"color:var(--muted);\">جارِ البحث...</div>';
     let list;
     try { ({ list } = await api('/api/admin/personnel/search?q=' + encodeURIComponent(q))); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر البحث (\${e.message})</div>\`; return; }
+    catch (e) { box.innerHTML = '<div class=\"card\" style=\"color:#f87171;\">تعذر البحث (' + escH(e.message) + ')</div>'; return; }
     if (document.getElementById('psearch-q')?.value.trim() !== q) return; // تجاوزه بحث أحدث
-    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا نتائج</div>'; return; }
-    box.innerHTML = list.map(p => \`
-        <div class="card" id="prow-\${p.discord}">
-            <div><b>\${p.registeredName || p.discordTag || p.discord}</b> <span style="color:var(--muted);font-size:12px;">(\${p.discordTag || '-'})</span></div>
-            <div style="font-size:12px;color:var(--gold-soft);margin:4px 0;">الرتبة: \${p.rank} — اليونت: \${p.unit || '-'} — النقاط: \${p.points}</div>
-            <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px;">
-                <button class="btn sm" onclick="psAction('\${p.discord}','up')">⬆️ ترقية</button>
-                <button class="btn sm gray" onclick="psAction('\${p.discord}','down')">⬇️ تنزيل</button>
-                <button class="btn sm" onclick="psPoints('\${p.discord}')">⭐ نقاط</button>
-                <button class="btn sm danger" onclick="psWarn('\${p.discord}')">⚠️ تحذير</button>
-            </div>
-        </div>\`).join('');
+    if (!list.length) { box.innerHTML = '<div class=\"card center\" style=\"color:var(--muted);\">لا نتائج</div>'; return; }
+    var isSenior = !!(ME && ME.isSeniorAdmin);
+    box.innerHTML = list.map(function (p) {
+        return '<div class="card" id="psr-' + p.discord + '">'
+            + '<div><b>' + escH(p.registeredName || p.discordTag || p.discord) + '</b> <span style="color:var(--muted);font-size:12px;">(' + escH(p.discordTag || '-') + ')</span></div>'
+            + '<div style="font-size:12px;color:var(--gold-soft);margin:4px 0;">الرتبة: ' + escH(p.rank) + ' — اليونت: ' + escH(p.unit || '-') + ' — النقاط: ' + p.points + ' — الآيدي: ' + p.discord + '</div>'
+            + '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px;">'
+            + '<button class="btn sm" onclick="psAction(\\'' + p.discord + '\\',\\'up\\')">⬆️ ترقية</button>'
+            + '<button class="btn sm gray" onclick="psAction(\\'' + p.discord + '\\',\\'down\\')">⬇️ تنزيل</button>'
+            + '<button class="btn sm" onclick="psPoints(\\'' + p.discord + '\\')">⭐ نقاط</button>'
+            + '<button class="btn sm danger" onclick="psWarn(\\'' + p.discord + '\\')">⚠️ تحذير</button></div>'
+            + (isSenior ? '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;"><select id="rk-' + p.discord + '" style="margin-bottom:0;flex:1;">'
+                + MILITARY_RANKS.slice().reverse().map(function (r) { return '<option' + (r === p.rank ? ' selected' : '') + '>' + escH(r) + '</option>'; }).join('')
+                + '</select><button class="btn sm gray" onclick="psSetRank(\\'' + p.discord + '\\')">تعيين الرتبة</button></div>' : '')
+            + '</div>';
+    }).join('');
 }
 async function psAction(discord, direction) {
     if (!confirm(direction === 'up' ? 'تأكيد الترقية؟' : 'تأكيد التنزيل؟')) return;
     try {
         const { personnel } = await api('/api/admin/personnel/' + discord + '/rank-direct', { method: 'POST', body: JSON.stringify({ direction }) });
         toast('تم');
-        runPersonnelSearch();
+        refreshPersonnelViews();
     } catch (e) { toast(e.message); }
 }
 function psPoints(discord) {
@@ -6520,13 +6649,13 @@ function psPoints(discord) {
     if (delta === null || delta.trim() === '') return;
     const reason = prompt('السبب:') || '';
     api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta: parseInt(delta, 10), reason }) })
-        .then(() => { toast('تم'); runPersonnelSearch(); }).catch(e => toast(e.message));
+        .then(() => { toast('تم'); refreshPersonnelViews(); }).catch(e => toast(e.message));
 }
 function psWarn(discord) {
     const reason = prompt('سبب التحذير:');
     if (!reason || !reason.trim()) return;
     api('/api/admin/personnel/' + discord + '/warning-direct', { method: 'POST', body: JSON.stringify({ reason }) })
-        .then(() => { toast('تم تسجيل التحذير'); runPersonnelSearch(); }).catch(e => toast(e.message));
+        .then(() => { toast('تم تسجيل التحذير'); refreshPersonnelViews(); }).catch(e => toast(e.message));
 }
 // طابور النقاط المعلّقة — أي نقاط منحها/خصمها شخص غير إداري تنتظر هنا موافقة أي إداري
 async function loadPointsRequestsPage() {
