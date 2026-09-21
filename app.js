@@ -35,8 +35,8 @@ const CONFIG = {
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
     BOT_TOKEN: process.env.BOT_TOKEN || "",
-    // آيدي الشخص الوحيد المسموح له بتشغيل/إطفاء البوت يدوياً من لوحة التحكم (فاضي = مسموح لكل كبار المسؤولين)
-    BOT_CONTROL_ID: process.env.BOT_CONTROL_ID || "",
+    // آيدي الشخص الوحيد المسموح له بتشغيل/إطفاء البوت وإدارة كبار المسؤولين من الموقع
+    BOT_CONTROL_ID: process.env.BOT_CONTROL_ID || "1003511814140743825",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
@@ -138,7 +138,10 @@ const CONFIG = {
 // 2) قاعدة البيانات والموديلات
 // ══════════════════════════════════════════════════════════════════════════
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(() => console.log("✅ MongoDB connected"))
+    .then(() => {
+        console.log("✅ MongoDB connected");
+        loadExtraSeniorAdmins();
+    })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -395,6 +398,8 @@ const SettingsSchema = new mongoose.Schema({
     disableLogin: { type: Boolean, default: false },
     disableViolations: { type: Boolean, default: false },
     adminList: { type: [String], default: [] }, // إداريون معيّنون (يقبلون/يرفضون المخالفات فقط)
+    // كبار مسؤولين إضافيين تُضاف آيديهم من الموقع (بدون تعديل الكود) — يُضافون لصلاحيات isSeniorAdmin الكاملة
+    extraSeniorAdminIds: { type: [String], default: [] },
     rankThresholds: { type: Map, of: Number, default: {} }, // رتبة -> نقاط مطلوبة للرتبة التالية
     // رتبة -> آيدي رول ديسكورد — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي (تعبّى من لوحة كبار المسؤولين)
     rankRoleIds: { type: Map, of: String, default: {} },
@@ -533,11 +538,22 @@ async function attachmentToBase64(url) {
     return `data:${contentType};base64,${buf.toString("base64")}`;
 }
 
-function isSeniorAdmin(userId) {
-    return CONFIG.SENIOR_ADMIN_IDS.includes(userId);
+// كبار مسؤولين إضافيين تُضاف آيديهم أثناء التشغيل من الموقع (تُحمَّل من قاعدة البيانات عند بدء التشغيل)
+let extraSeniorAdmins = [];
+async function loadExtraSeniorAdmins() {
+    try {
+        const s = await getSettings();
+        extraSeniorAdmins = s.extraSeniorAdminIds || [];
+    } catch (e) {
+        console.log("❌ فشل تحميل كبار المسؤولين الإضافيين:", e.message);
+    }
 }
 
-// التحكم بتشغيل/إطفاء البوت يدوياً: لو محدد BOT_CONTROL_ID يسمح لهذا الشخص فقط، وإلا يسمح لكل كبار المسؤولين
+function isSeniorAdmin(userId) {
+    return CONFIG.SENIOR_ADMIN_IDS.includes(userId) || extraSeniorAdmins.includes(userId);
+}
+
+// التحكم بتشغيل/إطفاء البوت وإدارة كبار المسؤولين: لهذا الشخص فقط (آيديه بـ CONFIG.BOT_CONTROL_ID)
 function isBotController(userId) {
     if (CONFIG.BOT_CONTROL_ID) return userId === CONFIG.BOT_CONTROL_ID;
     return isSeniorAdmin(userId);
@@ -3301,6 +3317,31 @@ app.post("/api/bot/toggle", ensureBotController, async (req, res) => {
         await logEvent({ action: "تشغيل البوت يدوياً", actorId: req.user.id, actorTag: req.user.username });
         return res.json({ ...result, online: botReady, starting: botStarting });
     }
+});
+
+// ── إدارة كبار المسؤولين من الموقع مباشرة (بدون تعديل الكود) — لصاحب BOT_CONTROL_ID فقط ──
+app.get("/api/bot/senior-admins", ensureBotController, async (req, res) => {
+    res.json({ core: CONFIG.SENIOR_ADMIN_IDS, extra: extraSeniorAdmins });
+});
+app.post("/api/bot/senior-admins/add", ensureBotController, async (req, res) => {
+    const discordId = (req.body?.discordId || "").trim();
+    if (!/^\d{15,25}$/.test(discordId)) return res.status(400).json({ error: "آيدي ديسكورد غير صحيح (أرقام فقط)" });
+    if (CONFIG.SENIOR_ADMIN_IDS.includes(discordId) || extraSeniorAdmins.includes(discordId)) {
+        return res.status(400).json({ error: "هذا الشخص كبير مسؤول أصلاً" });
+    }
+    const s = await getSettings();
+    s.extraSeniorAdminIds = [...(s.extraSeniorAdminIds || []), discordId];
+    await s.save();
+    extraSeniorAdmins = s.extraSeniorAdminIds;
+    res.json({ ok: true, extra: extraSeniorAdmins });
+});
+app.post("/api/bot/senior-admins/remove", ensureBotController, async (req, res) => {
+    const discordId = (req.body?.discordId || "").trim();
+    const s = await getSettings();
+    s.extraSeniorAdminIds = (s.extraSeniorAdminIds || []).filter(id => id !== discordId);
+    await s.save();
+    extraSeniorAdmins = s.extraSeniorAdminIds;
+    res.json({ ok: true, extra: extraSeniorAdmins });
 });
 
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -7269,10 +7310,12 @@ async function loadSettings() {
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>
         <div class="card" id="bot-control-card">جارِ تحميل حالة البوت...</div>
+        <div class="card" id="senior-admins-card"></div>
         <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>
         <div class="card" id="sector-role-card">جارِ تحميل آيديات رولات القطاعات...</div>
         <div class="card" id="rank-role-card">جارِ تحميل آيديات رتب العسكرية...</div>\`;
     loadBotControl();
+    loadSeniorAdmins();
     loadCommandPermissions();
     loadSectorRoleIds();
     loadRankRoleIds();
@@ -7285,7 +7328,7 @@ async function loadBotControl() {
     try {
         data = await api('/api/bot/status');
     } catch (e) {
-        box.innerHTML = '<h3 style="margin-bottom:10px;">🤖 حالة البوت</h3><p style="color:var(--muted);font-size:13px;">' + escH(e.message) + '</p>';
+        box.remove();
         return;
     }
     if (currentAdminTab !== 'settings') return;
@@ -7305,6 +7348,44 @@ async function toggleBot() {
         toast(e.message);
     }
     loadBotControl();
+}
+// ── إضافة/إزالة كبار المسؤولين من الموقع مباشرة (لصاحب صلاحية التحكم بالبوت فقط) ──
+async function loadSeniorAdmins() {
+    const box = document.getElementById('senior-admins-card');
+    if (!box) return;
+    let data;
+    try {
+        data = await api('/api/bot/senior-admins');
+    } catch (e) {
+        box.remove();
+        return;
+    }
+    if (currentAdminTab !== 'settings') return;
+    box.innerHTML = '<h3 style="margin-bottom:10px;">👑 كبار المسؤولين</h3>'
+        + '<p style="color:var(--muted);font-size:12px;margin-bottom:10px;">أضف آيدي ديسكورد أي شخص يصير كبير مسؤول كامل الصلاحيات فوراً بدون تعديل الكود.</p>'
+        + '<div class="row" style="gap:8px;"><input id="sa-new-id" placeholder="آيدي ديسكورد" inputmode="numeric" style="flex:1;"><button class="btn" onclick="addSeniorAdmin()">إضافة</button></div>'
+        + '<div style="margin-top:12px;">'
+        + (data.extra.length ? data.extra.map(id => '<div class="row" style="margin-top:6px;"><span>' + escH(id) + '</span><button class="btn" style="background:#ef4444;" onclick="removeSeniorAdmin(\\'' + escH(id) + '\\')">إزالة</button></div>').join('') : '<p style="color:var(--muted);font-size:12px;">ما فيه كبار مسؤولين مضافين من الموقع بعد.</p>')
+        + '</div>';
+}
+async function addSeniorAdmin() {
+    const input = document.getElementById('sa-new-id');
+    const discordId = (input.value || '').trim();
+    if (!discordId) return toast('اكتب آيدي الشخص أول');
+    try {
+        await api('/api/bot/senior-admins/add', { method: 'POST', body: JSON.stringify({ discordId }) });
+        toast('تمت الإضافة');
+        input.value = '';
+        loadSeniorAdmins();
+    } catch (e) { toast(e.message); }
+}
+async function removeSeniorAdmin(discordId) {
+    if (!confirm('متأكد تبي تزيل صلاحيات هذا الشخص؟')) return;
+    try {
+        await api('/api/bot/senior-admins/remove', { method: 'POST', body: JSON.stringify({ discordId }) });
+        toast('تمت الإزالة');
+        loadSeniorAdmins();
+    } catch (e) { toast(e.message); }
 }
 // آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي
 async function loadRankRoleIds() {
