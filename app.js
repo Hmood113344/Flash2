@@ -3959,7 +3959,6 @@ function buildNav() {
         { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
     ];
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
-    if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
@@ -3967,7 +3966,6 @@ function buildNav() {
 function renderFabs() {
     const fabs = [];
     if (ME.isAdmin) fabs.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
-    if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
