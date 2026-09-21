@@ -35,6 +35,8 @@ const CONFIG = {
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
     BOT_TOKEN: process.env.BOT_TOKEN || "",
+    // آيدي الشخص الوحيد المسموح له بتشغيل/إطفاء البوت يدوياً من لوحة التحكم (فاضي = مسموح لكل كبار المسؤولين)
+    BOT_CONTROL_ID: process.env.BOT_CONTROL_ID || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
@@ -535,6 +537,12 @@ function isSeniorAdmin(userId) {
     return CONFIG.SENIOR_ADMIN_IDS.includes(userId);
 }
 
+// التحكم بتشغيل/إطفاء البوت يدوياً: لو محدد BOT_CONTROL_ID يسمح لهذا الشخص فقط، وإلا يسمح لكل كبار المسؤولين
+function isBotController(userId) {
+    if (CONFIG.BOT_CONTROL_ID) return userId === CONFIG.BOT_CONTROL_ID;
+    return isSeniorAdmin(userId);
+}
+
 async function isAnyAdmin(userId) {
     if (isSeniorAdmin(userId)) return true;
     const settings = await getSettings();
@@ -787,6 +795,35 @@ const client = new Client({
 
 const pendingMessages = new Map(); // violationId -> { channelId, messageId }
 let botReady = false;
+let botStarting = false;
+let botStoppedManually = false; // true لما يُطفى البوت بالزر يدوياً (يمنع أي محاولة اتصال تلقائي وهو مطفى بقصد)
+
+async function startBot() {
+    if (botReady || botStarting) return { ok: true, already: true };
+    if (!CONFIG.BOT_TOKEN) return { ok: false, error: "BOT_TOKEN غير موجود بمتغيرات البيئة" };
+    botStarting = true;
+    botStoppedManually = false;
+    try {
+        await client.login(CONFIG.BOT_TOKEN);
+        return { ok: true };
+    } catch (e) {
+        console.log("❌ فشل تسجيل دخول البوت:", e.message);
+        return { ok: false, error: e.message };
+    } finally {
+        botStarting = false;
+    }
+}
+
+async function stopBot() {
+    botStoppedManually = true;
+    botReady = false;
+    try {
+        await client.destroy();
+    } catch (e) {
+        console.log("❌ خطأ أثناء إطفاء البوت:", e.message);
+    }
+    return { ok: true };
+}
 
 async function isMilitary(discordId) {
     if (!botReady) return { ok: false, reason: "البوت لسا ما اتصل بديسكورد، حاول بعد ثوانٍ" };
@@ -1250,7 +1287,7 @@ async function handleCommandCommand(interaction) {
     await interaction.deferReply();
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
-        "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار، ونقاط الاستلام (تختار الشخص اللي تعطيه).\n\n" +
+        "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار (تختار الشخص اللي تعطيه).\n\n" +
         `**الرتبة المطلوبة لأغلب الأزرار:** ${settings.commandPermissions.command} فما فوق\n` +
         "**قادة ونواب القطاعات:** يستخدمون الأزرار على أفراد قطاعهم فقط، وزر «حضور القطاع» يعرض لهم مين داخل ومين خارج ووقت الدخول والخروج.");
     const row1 = new ActionRowBuilder().addComponents(
@@ -1261,7 +1298,6 @@ async function handleCommandCommand(interaction) {
         new ButtonBuilder().setCustomId("cmd_notice_start").setLabel("📢 إشعار").setStyle(ButtonStyle.Secondary),
     );
     const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("cmd_reception").setLabel(`🪖 نقاط الاستلام (+${CONFIG.RECEPTION_POINTS})`).setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("cmd_att_view").setLabel("📋 حضور القطاع").setStyle(ButtonStyle.Secondary),
     );
     await interaction.editReply({ embeds: [embed], components: [row1, row2] });
@@ -1300,25 +1336,6 @@ async function handleCommandPointsStart(interaction) {
 async function handleCommandNoticeStart(interaction) {
     return startCommandFlow(interaction, "notice", "اختر الفرد المطلوب إرسال إشعار له", "**اختر الفرد**");
 }
-// نقاط الاستلام — أول ما تضغط الزر يطلب منك تختار الشخص اللي تبي تعطيه النقاط، وبعدها تنطبق مباشرة (مقيّدة بحد أقصى يومي لكل شخص)
-async function handleCommandReceptionButton(interaction) {
-    return startCommandFlow(interaction, "reception", "اختر الشخص اللي تبي تعطيه نقاط الاستلام", `**🪖 نقاط الاستلام (+${CONFIG.RECEPTION_POINTS})**\nاختر الشخص اللي تبي تعطيه نقاط الاستلام:`);
-}
-async function finishReception(interaction, session, targetId) {
-    cmdSessions.delete(interaction.user.id);
-    const todayStart = new Date(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Riyadh" }).format(new Date()) + "T00:00:00.000+03:00");
-    const countToday = await Log.countDocuments({ action: "نقاط الاستلام", discordId: targetId, createdAt: { $gte: todayStart } });
-    if (countToday >= CONFIG.RECEPTION_MAX_PER_DAY) {
-        return interaction.editReply({ content: `🚫 <@${targetId}> وصل الحد الأقصى لنقاط الاستلام اليوم (${CONFIG.RECEPTION_MAX_PER_DAY} مرات).`, components: [] });
-    }
-    const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-    const targetMember = await guild.members.fetch(targetId).catch(() => null);
-    const target = await getOrCreatePersonnel(targetId, targetMember);
-    await applyOrQueuePoints({ discordId: targetId, delta: CONFIG.RECEPTION_POINTS, actorId: interaction.user.id, actorTag: interaction.user.username, source: "reception", reason: "نقاط الاستلام" });
-    await checkAutoPromotion(targetId);
-    await logEvent({ action: "نقاط الاستلام", discordId: targetId, discordTag: target.discordTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `+${CONFIG.RECEPTION_POINTS} نقطة (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم)` });
-    await interaction.editReply({ content: `✅ تم إضافة ${CONFIG.RECEPTION_POINTS} نقاط استلام لـ<@${targetId}> (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم).`, components: [] });
-}
 async function handleCommandTargetSelect(interaction) {
     const session = cmdSessions.get(interaction.user.id);
     // الأزرار اللي تفتح نموذج (Modal) لازم ما نرد على التفاعل قبل فتحه، وإلا ديسكورد يرفض فتح النموذج ويطلع "فشل التفاعل"
@@ -1327,8 +1344,7 @@ async function handleCommandTargetSelect(interaction) {
     const reply = (payload) => (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
     if (!session) return reply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     const targetId = interaction.values[0];
-    // نقاط الاستلام يمديك تعطيها لنفسك أو لغيرك (ضمن الحد اليومي)، أما بقية الأزرار فما تقدر تختار نفسك
-    if (session.action !== "reception" && targetId === interaction.user.id) {
+    if (targetId === interaction.user.id) {
         cmdSessions.delete(interaction.user.id);
         return reply({ content: "🚫 ما تقدر تختار نفسك.", components: [] });
     }
@@ -1344,7 +1360,6 @@ async function handleCommandTargetSelect(interaction) {
             return reply({ content: `🚫 صلاحيتك على أفراد ${CONFIG.SECTORS[session.leaderSector]} فقط، والشخص المختار مو من قطاعك.`, components: [] });
         }
     }
-    if (session.action === "reception") return finishReception(interaction, session, targetId);
     session.targetId = targetId;
 
     if (session.action === "warn" || session.action === "notice") {
@@ -1786,7 +1801,6 @@ client.on("interactionCreate", async interaction => {
                 cmd_note_start: handleCommandNoteStart,
                 cmd_points_start: handleCommandPointsStart,
                 cmd_notice_start: handleCommandNoticeStart,
-                cmd_reception: handleCommandReceptionButton,
                 cmd_att_view: handleCommandAttendanceView,
                 cmd_dir_up: handleCommandDirectionButton,
                 cmd_dir_down: handleCommandDirectionButton,
@@ -1891,14 +1905,17 @@ client.on("messageCreate", async message => {
     }
 });
 
-client.once("ready", async () => {
+client.on("ready", async () => {
     console.log(`🤖 البوت شغال: ${client.user.tag}`);
     botReady = true;
     await registerCommands();
 });
 
+client.on("shardDisconnect", () => { botReady = false; });
+client.on("invalidated", () => { botReady = false; });
+
 if (CONFIG.BOT_TOKEN) {
-    client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
+    startBot();
 } else {
     console.log("⚠️ BOT_TOKEN غير موجود — البوت لن يعمل، تحقق من متغيرات البيئة");
 }
@@ -1993,6 +2010,12 @@ async function isOpsCenterUser(userId) {
 async function ensureSeniorAdmin(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     if (!isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا القسم لكبار المسؤولين فقط" });
+    next();
+}
+
+async function ensureBotController(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (!isBotController(req.user.id)) return res.status(403).json({ error: "ما عندك صلاحية التحكم بالبوت" });
     next();
 }
 
@@ -3262,6 +3285,22 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
         .addFields({ name: "المدة المطلوبة", value: `${leave.days} يوم` }, { name: "السبب", value: leave.rejectReason || "-" })
         .setTimestamp()).catch(() => {});
     res.json({ ok: true, leave });
+});
+
+// ── تشغيل/إطفاء البوت يدوياً ──
+app.get("/api/bot/status", ensureBotController, (req, res) => {
+    res.json({ online: botReady, starting: botStarting, hasToken: !!CONFIG.BOT_TOKEN });
+});
+app.post("/api/bot/toggle", ensureBotController, async (req, res) => {
+    if (botReady) {
+        const result = await stopBot();
+        await logEvent({ action: "إطفاء البوت يدوياً", actorId: req.user.id, actorTag: req.user.username });
+        return res.json({ ...result, online: botReady });
+    } else {
+        const result = await startBot();
+        await logEvent({ action: "تشغيل البوت يدوياً", actorId: req.user.id, actorTag: req.user.username });
+        return res.json({ ...result, online: botReady, starting: botStarting });
+    }
 });
 
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -7229,12 +7268,43 @@ async function loadSettings() {
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>
+        <div class="card" id="bot-control-card">جارِ تحميل حالة البوت...</div>
         <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>
         <div class="card" id="sector-role-card">جارِ تحميل آيديات رولات القطاعات...</div>
         <div class="card" id="rank-role-card">جارِ تحميل آيديات رتب العسكرية...</div>\`;
+    loadBotControl();
     loadCommandPermissions();
     loadSectorRoleIds();
     loadRankRoleIds();
+}
+// ── تشغيل/إطفاء البوت يدوياً ──
+async function loadBotControl() {
+    const box = document.getElementById('bot-control-card');
+    if (!box) return;
+    let data;
+    try {
+        data = await api('/api/bot/status');
+    } catch (e) {
+        box.innerHTML = '<h3 style="margin-bottom:10px;">🤖 حالة البوت</h3><p style="color:var(--muted);font-size:13px;">' + escH(e.message) + '</p>';
+        return;
+    }
+    if (currentAdminTab !== 'settings') return;
+    const online = data.online;
+    box.innerHTML = '<h3 style="margin-bottom:10px;">🤖 حالة البوت</h3>'
+        + '<div class="row"><span>' + (online ? '🟢 البوت شغال' : (data.starting ? '🟡 جارِ التشغيل...' : '🔴 البوت مطفي')) + '</span></div>'
+        + '<button class="btn" id="bot-toggle-btn" style="margin-top:12px;background:' + (online ? '#ef4444' : '#22c55e') + ';" onclick="toggleBot()"' + (data.starting ? ' disabled' : '') + '>'
+        + (online ? 'إطفاء البوت' : 'تشغيل البوت') + '</button>';
+}
+async function toggleBot() {
+    const btn = document.getElementById('bot-toggle-btn');
+    if (btn) btn.disabled = true;
+    try {
+        await api('/api/bot/toggle', { method: 'POST' });
+        toast('تم تنفيذ الأمر');
+    } catch (e) {
+        toast(e.message);
+    }
+    loadBotControl();
 }
 // آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي
 async function loadRankRoleIds() {
