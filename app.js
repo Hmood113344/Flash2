@@ -3973,7 +3973,6 @@ function renderFabs() {
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
-    else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
