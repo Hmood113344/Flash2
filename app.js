@@ -1524,7 +1524,7 @@ client.on("interactionCreate", async interaction => {
                 "لوحة-التسجيل": handleAttendanceCommand,
             };
             const cmdFn = cmdMap[commandName];
-            if (cmdFn) return cmdFn(interaction);
+            if (cmdFn) { await cmdFn(interaction); } return;
             return;
         }
 
@@ -1575,18 +1575,18 @@ client.on("interactionCreate", async interaction => {
                 att_out: handleAttendanceButton,
             };
             const btnFn = btnMap[id];
-            if (btnFn) return btnFn(interaction);
+            if (btnFn) { await btnFn(interaction); } return;
             return;
         }
 
         // ── قوائم اختيار ─────────────────────────────────────────────
         if (interaction.isStringSelectMenu()) {
-            if (interaction.customId === "viol_types_select") return handleViolationTypesSelect(interaction);
-            if (interaction.customId === "viol_vehicle_select") return handleViolationVehicleSelect(interaction);
+            if (interaction.customId === "viol_types_select") { await handleViolationTypesSelect(interaction); return; }
+            if (interaction.customId === "viol_vehicle_select") { await handleViolationVehicleSelect(interaction); return; }
             return;
         }
         if (interaction.isUserSelectMenu()) {
-            if (interaction.customId === "cmd_target_select") return handleCommandTargetSelect(interaction);
+            if (interaction.customId === "cmd_target_select") { await handleCommandTargetSelect(interaction); return; }
             return;
         }
 
@@ -1602,11 +1602,11 @@ client.on("interactionCreate", async interaction => {
                 await rejectViolation(v, interaction.user.id, interaction.user.username, reason);
                 return interaction.reply({ content: "✅ تم رفض المخالفة وحفظ السبب.", ephemeral: true });
             }
-            if (interaction.customId === "cmd_reason_modal") return handleCommandReasonModal(interaction);
-            if (interaction.customId === "cmd_warnnotice_modal") return handleCommandWarnNoticeModal(interaction);
-            if (interaction.customId === "cmd_note_modal") return handleCommandNoteModal(interaction);
-            if (interaction.customId === "cmd_points_modal") return handleCommandPointsModal(interaction);
-            if (interaction.customId === "leave_modal") return handleLeaveModal(interaction);
+            if (interaction.customId === "cmd_reason_modal") { await handleCommandReasonModal(interaction); return; }
+            if (interaction.customId === "cmd_warnnotice_modal") { await handleCommandWarnNoticeModal(interaction); return; }
+            if (interaction.customId === "cmd_note_modal") { await handleCommandNoteModal(interaction); return; }
+            if (interaction.customId === "cmd_points_modal") { await handleCommandPointsModal(interaction); return; }
+            if (interaction.customId === "leave_modal") { await handleLeaveModal(interaction); return; }
             return;
         }
     } catch (e) {
@@ -3973,6 +3973,7 @@ function renderFabs() {
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
+    else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
