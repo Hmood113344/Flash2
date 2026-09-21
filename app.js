@@ -113,6 +113,8 @@ const CONFIG = {
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
     MP_SUMMON_VOICE_URL: "https://discord.com/channels/1497233353030766662/1545415195243843644",
     MP_REPORT_POINTS_APPROVE: 1, // نقاط قبول تقرير الشرطة العسكرية
+    RECEPTION_POINTS: 5, // نقاط الاستلام (زر تحكم-قياده)
+    RECEPTION_MAX_PER_DAY: 2, // أقصى عدد مرات لكل شخص يومياً
 
     // عقوبات التحذير الثالث — المسؤول يختار وحدة منها وقت إرسال التحذير الثالث لأي عسكري
     WARNING_PENALTIES: [
@@ -251,6 +253,27 @@ const PromotionRequestSchema = new mongoose.Schema({
 PromotionRequestSchema.index({ sector: 1, status: 1, createdAt: -1 });
 const PromotionRequest = mongoose.model("PromotionRequest", PromotionRequestSchema);
 
+// طلبات نقاط معلّقة — أي نقاط يمنحها/يخصمها شخص غير إداري (قائد/نائب قطاع، مسؤول أفراد، قيادة شرطة عسكرية...)
+// تنتظر موافقة أي إداري (كبير مسؤول أو من قائمة الإدارة) قبل ما تنطبق فعلياً على رصيد العسكري
+const PointsRequestSchema = new mongoose.Schema({
+    targetDiscord: String,
+    targetTag: String,
+    targetName: String,
+    delta: { type: Number, required: true }, // موجب = إضافة، سالب = خصم
+    reason: { type: String, default: "" },
+    source: { type: String, default: "manual" }, // manual | violation | report | mp-report
+    requestedBy: String,
+    requestedByTag: String,
+    status: { type: String, default: "pending" }, // pending | approved | rejected
+    rejectReason: { type: String, default: null },
+    reviewedBy: String,
+    reviewedByTag: String,
+    reviewedAt: Date,
+    createdAt: { type: Date, default: Date.now },
+});
+PointsRequestSchema.index({ status: 1, createdAt: -1 });
+const PointsRequest = mongoose.model("PointsRequest", PointsRequestSchema);
+
 // تقارير الشرطة العسكرية (يسجلها أي شخص معه رتبة الشرطة العسكرية بدل تسجيل مخالفة)
 const MPReportSchema = new mongoose.Schema({
     reporterDiscord: String, reporterTag: String, reporterName: String, reporterRank: String,
@@ -355,6 +378,8 @@ const SettingsSchema = new mongoose.Schema({
     disableViolations: { type: Boolean, default: false },
     adminList: { type: [String], default: [] }, // إداريون معيّنون (يقبلون/يرفضون المخالفات فقط)
     rankThresholds: { type: Map, of: Number, default: {} }, // رتبة -> نقاط مطلوبة للرتبة التالية
+    // رتبة -> آيدي رول ديسكورد — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي (تعبّى من لوحة كبار المسؤولين)
+    rankRoleIds: { type: Map, of: String, default: {} },
     // قادة ونواب القطاعات الثلاثة — يُعيّنهم كبار المسؤولين من الموقع (بحث عن شخص مسجل بالموقع)
     sectorLeadership: {
         patrol: {
@@ -474,6 +499,31 @@ async function isAnyAdmin(userId) {
     if (isSeniorAdmin(userId)) return true;
     const settings = await getSettings();
     return settings.adminList.includes(userId);
+}
+
+// يطبّق تغيير نقاط فوراً لو الفاعل إداري (كبير مسؤول أو من قائمة الإدارة)، وإلا يحط طلب معلّق بانتظار موافقة أي إداري.
+// لو الفاعل يحاول يعطي نفسه نقاط (وهو مو إداري) نرفض العملية نهائياً بدل ما نحطها بالطلبات المعلّقة (استثناء: source === "reception" — نقاط الاستلام مسموحة للنفس ضمن حدّها اليومي، وتُطبَّق مباشرة بدون طلب لأنها مقيّدة أصلاً).
+async function applyOrQueuePoints({ discordId, delta, reason, source, actorId, actorTag }) {
+    if (!delta) return { applied: false, skipped: true };
+    const admin = await isAnyAdmin(actorId);
+    // إداري يحاول يعطي نفسه نقاط بدون مراجعة من طرف ثاني — ممنوع نهائياً (إلا نقاط الاستلام المقيّدة أصلاً)
+    if (admin && source !== "reception" && discordId === actorId) {
+        return { applied: false, blocked: true, error: "ما تقدر تعطي نفسك نقاط." };
+    }
+    if (admin || source === "reception") {
+        const p = await Personnel.findOneAndUpdate({ discord: discordId }, { $inc: { points: delta } }, { new: true });
+        if (p && p.points < 0) { p.points = 0; await p.save(); }
+        return { applied: true, personnel: p };
+    }
+    const target = await Personnel.findOne({ discord: discordId });
+    const doc = await PointsRequest.create({
+        targetDiscord: discordId,
+        targetTag: target?.discordTag || null,
+        targetName: target?.registeredName || target?.discordTag || null,
+        delta, reason: reason || "", source: source || "manual",
+        requestedBy: actorId, requestedByTag: actorTag,
+    });
+    return { applied: false, queued: true, request: doc };
 }
 
 async function getThreshold(rank, settings) {
@@ -706,6 +756,30 @@ async function isMilitary(discordId) {
     } catch (e) {
         console.error("❌ isMilitary خطأ:", e.message);
         return { ok: false, reason: e.message };
+    }
+}
+
+// يفحص رولات ديسكورد الشخص مقابل خريطة settings.rankRoleIds (تعبّيها كبار المسؤولين من الإعدادات)
+// ويرجع أعلى رتبة يملك روحها، أو null لو ما عنده أي رول من المحددة أو ما فيه إعداد أصلاً
+async function detectRankFromRoles(discordId, settings) {
+    const map = settings.rankRoleIds;
+    if (!map || (typeof map.size === "number" && map.size === 0)) return null;
+    if (!botReady) return null;
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const member = await guild.members.fetch(discordId);
+        let bestIdx = -1, bestRank = null;
+        for (const rank of CONFIG.MILITARY_RANKS) {
+            const roleId = typeof map.get === "function" ? map.get(rank) : map[rank];
+            if (!roleId) continue;
+            if (member.roles.cache.has(roleId)) {
+                const idx = rankIndex(rank);
+                if (idx > bestIdx) { bestIdx = idx; bestRank = rank; }
+            }
+        }
+        return bestRank;
+    } catch (e) {
+        return null;
     }
 }
 
@@ -976,15 +1050,19 @@ async function approveViolation(v, actorId, actorTag) {
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
-    await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: pts } });
-    await checkAutoPromotion(v.reporterDiscord);
-    await syncViolationMessage(v);
     const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` });
+    const pr = await applyOrQueuePoints({
+        discordId: v.reporterDiscord, delta: pts, actorId, actorTag,
+        source: v.kind === "report" ? "report" : "violation",
+        reason: `قبول ${label} — ${v.reporterName}`,
+    });
+    if (pr.applied) await checkAutoPromotion(v.reporterDiscord);
+    await syncViolationMessage(v);
+    await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}${pr.queued ? " (النقاط بانتظار موافقة الإدارة)" : ""}` });
     dmMember(v.reporterDiscord, new EmbedBuilder()
         .setTitle("✅ تم قبول مخالفتك")
         .setColor(0x22c55e)
-        .addFields({ name: "النوع", value: label }, { name: "النقاط المكتسبة", value: `+${pts}` })
+        .addFields({ name: "النوع", value: label }, { name: pr.queued ? "النقاط" : "النقاط المكتسبة", value: pr.queued ? `+${pts} (بانتظار موافقة الإدارة)` : `+${pts}` })
         .setTimestamp()).catch(() => {});
     return { blocked: false };
 }
@@ -995,11 +1073,14 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
-    await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: -pts } });
-    await Personnel.updateOne({ discord: v.reporterDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
-    await syncViolationMessage(v);
     const rlabel = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` });
+    const pr = await applyOrQueuePoints({
+        discordId: v.reporterDiscord, delta: -pts, actorId, actorTag,
+        source: v.kind === "report" ? "report" : "violation",
+        reason: `رفض ${rlabel} — ${v.reporterName} — السبب: ${reason}`,
+    });
+    await syncViolationMessage(v);
+    await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}${pr.queued ? " (خصم النقاط بانتظار موافقة الإدارة)" : ""}` });
     dmMember(v.reporterDiscord, new EmbedBuilder()
         .setTitle("❌ تم رفض مخالفتك")
         .setColor(0xef4444)
@@ -1020,7 +1101,6 @@ function brandEmbed() { return new EmbedBuilder().setColor(0xd4af37).setFooter({
 
 async function handleViolationCommand(interaction) {
     await interaction.deferReply();
-    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("📝 لوحة إصدار المخالفات العسكرية").setDescription(
         "هذي اللوحة الرسمية لتسجيل مخالفة مرورية بحق أي مركبة أثناء الخدمة.\n\n" +
@@ -1093,34 +1173,101 @@ async function handleViolationVehicleSelect(interaction) {
 
 async function handleCommandCommand(interaction) {
     await interaction.deferReply();
-    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
-        "لتقديم طلب ترقية أو تنزيل رتبة لأحد الأفراد — الطلب يروح مباشرة للقيادة العليا لاعتماده.\n\n" +
-        `**الرتبة المطلوبة لاستخدام الزر:** ${settings.commandPermissions.command} فما فوق`);
-    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ تقديم طلب ترقية/تنزيل").setStyle(ButtonStyle.Primary));
-    await interaction.editReply({ embeds: [embed], components: [row] });
+        "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار، ونقاط الاستلام اليومية.\n\n" +
+        `**الرتبة المطلوبة لأغلب الأزرار:** ${settings.commandPermissions.command} فما فوق`);
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ ترقية/تنزيل").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("cmd_warn_start").setLabel("⚠️ تحذير").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("cmd_note_start").setLabel("📝 ملاحظة").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("cmd_points_start").setLabel("⭐ نقاط").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("cmd_notice_start").setLabel("📢 إشعار").setStyle(ButtonStyle.Secondary),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("cmd_reception").setLabel(`🪖 نقاط الاستلام (+${CONFIG.RECEPTION_POINTS})`).setStyle(ButtonStyle.Primary),
+    );
+    await interaction.editReply({ embeds: [embed], components: [row1, row2] });
 }
-async function handleCommandStart(interaction) {
+// نقطة دخول مشتركة لكل أزرار القيادة اللي تحتاج اختيار فرد (ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار)
+async function startCommandFlow(interaction, action, placeholder, stepLabel) {
     await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
     if (!rankAtLeast(p.rank, settings.commandPermissions.command)) {
         return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).` });
     }
-    const menu = new UserSelectMenuBuilder().setCustomId("cmd_target_select").setPlaceholder("اختر الفرد المطلوب ترقيته أو تنزيله");
-    await interaction.editReply({ content: "**الخطوة ١ من ٣ — اختيار الفرد**", components: [new ActionRowBuilder().addComponents(menu)] });
+    cmdSessions.set(interaction.user.id, { action });
+    const menu = new UserSelectMenuBuilder().setCustomId("cmd_target_select").setPlaceholder(placeholder);
+    await interaction.editReply({ content: stepLabel, components: [new ActionRowBuilder().addComponents(menu)] });
+}
+async function handleCommandStart(interaction) {
+    return startCommandFlow(interaction, "promote", "اختر الفرد المطلوب ترقيته أو تنزيله", "**الخطوة ١ من ٣ — اختيار الفرد**");
+}
+async function handleCommandWarnStart(interaction) {
+    return startCommandFlow(interaction, "warn", "اختر الفرد المطلوب تحذيره", "**اختر الفرد**");
+}
+async function handleCommandNoteStart(interaction) {
+    return startCommandFlow(interaction, "note", "اختر الفرد المطلوب تسجيل ملاحظة عليه", "**اختر الفرد**");
+}
+async function handleCommandPointsStart(interaction) {
+    return startCommandFlow(interaction, "points", "اختر الفرد المطلوب تعديل نقاطه", "**اختر الفرد**");
+}
+async function handleCommandNoticeStart(interaction) {
+    return startCommandFlow(interaction, "notice", "اختر الفرد المطلوب إرسال إشعار له", "**اختر الفرد**");
+}
+// نقاط الاستلام — يعطيها العضو لنفسه مباشرة، مقيّدة بحد أقصى يومي
+async function handleCommandReceptionButton(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const todayStart = new Date(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Riyadh" }).format(new Date()) + "T00:00:00.000+03:00");
+    const countToday = await Log.countDocuments({ action: "نقاط الاستلام", discordId: interaction.user.id, createdAt: { $gte: todayStart } });
+    if (countToday >= CONFIG.RECEPTION_MAX_PER_DAY) {
+        return interaction.editReply({ content: `🚫 وصلت الحد الأقصى لنقاط الاستلام اليوم (${CONFIG.RECEPTION_MAX_PER_DAY} مرات).` });
+    }
+    await applyOrQueuePoints({ discordId: interaction.user.id, delta: CONFIG.RECEPTION_POINTS, actorId: interaction.user.id, actorTag: interaction.user.username, source: "reception", reason: "نقاط الاستلام" });
+    await checkAutoPromotion(interaction.user.id);
+    await logEvent({ action: "نقاط الاستلام", discordId: interaction.user.id, discordTag: interaction.user.username, actorId: interaction.user.id, actorTag: interaction.user.username, details: `+${CONFIG.RECEPTION_POINTS} نقطة (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم)` });
+    await interaction.editReply({ content: `✅ تم إضافة ${CONFIG.RECEPTION_POINTS} نقاط استلام لك (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم).` });
 }
 async function handleCommandTargetSelect(interaction) {
     await interaction.deferUpdate();
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     const targetId = interaction.values[0];
+    if (targetId === interaction.user.id) {
+        cmdSessions.delete(interaction.user.id);
+        return interaction.editReply({ content: "🚫 ما تقدر تختار نفسك.", components: [] });
+    }
     const target = await getOrCreatePersonnel(targetId, null);
-    cmdSessions.set(interaction.user.id, { targetId, targetRank: target.rank });
-    const idx = rankIndex(target.rank);
-    const row = new ActionRowBuilder();
-    if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
-    if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
-    await interaction.editReply({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
+    session.targetId = targetId;
+    session.targetRank = target.rank;
+
+    if (session.action === "promote") {
+        const idx = rankIndex(target.rank);
+        const row = new ActionRowBuilder();
+        if (idx < CONFIG.MILITARY_RANKS.length - 1) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_up").setLabel(`⬆️ ترقية إلى ${CONFIG.MILITARY_RANKS[idx + 1]}`).setStyle(ButtonStyle.Success));
+        if (idx > 0) row.addComponents(new ButtonBuilder().setCustomId("cmd_dir_down").setLabel(`⬇️ تنزيل إلى ${CONFIG.MILITARY_RANKS[idx - 1]}`).setStyle(ButtonStyle.Danger));
+        return interaction.editReply({ content: `**الخطوة ٢ من ٣ — الاتجاه**\nالفرد: <@${targetId}>\nرتبته الحالية: ${target.rank}`, components: row.components.length ? [row] : [] });
+    }
+    if (session.action === "warn" || session.action === "notice") {
+        const modal = new ModalBuilder().setCustomId("cmd_warnnotice_modal").setTitle(session.action === "warn" ? "سبب التحذير" : "نص الإشعار");
+        const input = new TextInputBuilder().setCustomId("reason").setLabel("اكتب النص").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+    }
+    if (session.action === "note") {
+        const modal = new ModalBuilder().setCustomId("cmd_note_modal").setTitle("نص الملاحظة");
+        const input = new TextInputBuilder().setCustomId("text").setLabel("اكتب الملاحظة").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+    }
+    if (session.action === "points") {
+        const modal = new ModalBuilder().setCustomId("cmd_points_modal").setTitle("تعديل نقاط");
+        const amountInput = new TextInputBuilder().setCustomId("amount").setLabel("عدد النقاط (استخدم - للخصم، مثال: -5)").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10);
+        const reasonInput = new TextInputBuilder().setCustomId("reason").setLabel("السبب").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(300);
+        modal.addComponents(new ActionRowBuilder().addComponents(amountInput), new ActionRowBuilder().addComponents(reasonInput));
+        return interaction.showModal(modal);
+    }
 }
 async function handleCommandDirectionButton(interaction) {
     const session = cmdSessions.get(interaction.user.id);
@@ -1139,6 +1286,10 @@ async function handleCommandReasonModal(interaction) {
     const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
     const targetMember = await guild.members.fetch(session.targetId).catch(() => null);
     const target = await getOrCreatePersonnel(session.targetId, targetMember);
+    if (session.targetId === interaction.user.id) {
+        cmdSessions.delete(interaction.user.id);
+        return interaction.editReply({ content: "🚫 ما تقدر ترقي أو تنزل نفسك." });
+    }
     const idx = rankIndex(target.rank);
     const toRank = session.direction === "up" ? CONFIG.MILITARY_RANKS[idx + 1] : CONFIG.MILITARY_RANKS[idx - 1];
     const sectorKey = await getMemberSectorKey(session.targetId);
@@ -1155,10 +1306,66 @@ async function handleCommandReasonModal(interaction) {
     notifyHighCommandOfPromotion(doc).catch(() => {});
     await interaction.editReply({ content: `✅ تم إرسال طلبك بخصوص ${target.registeredName || "الفرد"}، بانتظار موافقة القيادة العليا.` });
 }
+async function handleCommandWarnNoticeModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر." });
+    if (session.targetId === interaction.user.id) {
+        cmdSessions.delete(interaction.user.id);
+        return interaction.editReply({ content: "🚫 ما تقدر تسوي هذا الإجراء على نفسك." });
+    }
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const kind = session.action === "warn" ? "warning" : "notice";
+    cmdSessions.delete(interaction.user.id);
+    try {
+        const { p: result, dismissed } = await issueWarning({ targetDiscord: session.targetId, kind, reason, actorId: interaction.user.id, actorTag: interaction.user.username });
+        dmMember(session.targetId, new EmbedBuilder()
+            .setTitle(kind === "warning" ? "⚠️ تلقيت تحذيراً" : "📢 إشعار جديد")
+            .setColor(kind === "warning" ? 0xef4444 : 0x60a5fa)
+            .setDescription(reason)
+            .setTimestamp()).catch(() => {});
+        await interaction.editReply({ content: dismissed ? "⚠️ تم تسجيل التحذير — وتجاوز الفرد الحد المسموح فتم فصله تلقائياً." : (kind === "warning" ? "✅ تم تسجيل التحذير." : "✅ تم إرسال الإشعار.") });
+    } catch (e) {
+        await interaction.editReply({ content: `❌ ${e.message}` });
+    }
+}
+async function handleCommandNoteModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر." });
+    if (session.targetId === interaction.user.id) {
+        cmdSessions.delete(interaction.user.id);
+        return interaction.editReply({ content: "🚫 ما تقدر تسجل ملاحظة على نفسك." });
+    }
+    const text = interaction.fields.getTextInputValue("text").trim();
+    cmdSessions.delete(interaction.user.id);
+    const p = await pushNoteWithImage({ discord: session.targetId, text, image: null, actorId: interaction.user.id, actorTag: interaction.user.username });
+    if (!p) return interaction.editReply({ content: "❌ هذا الفرد غير مسجل بالنظام أصلاً." });
+    await logEvent({ action: "ملاحظة (بوت الأوامر)", discordId: session.targetId, discordTag: p.discordTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: text });
+    await interaction.editReply({ content: "✅ تم تسجيل الملاحظة." });
+}
+async function handleCommandPointsModal(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    const session = cmdSessions.get(interaction.user.id);
+    if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد بالأمر." });
+    const amountRaw = interaction.fields.getTextInputValue("amount").trim();
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const delta = parseInt(amountRaw, 10);
+    cmdSessions.delete(interaction.user.id);
+    if (isNaN(delta) || delta === 0) return interaction.editReply({ content: "❌ حط عدد نقاط صحيح (مو صفر)." });
+    const pr = await applyOrQueuePoints({ discordId: session.targetId, delta, actorId: interaction.user.id, actorTag: interaction.user.username, source: "manual", reason: `(بوت الأوامر) ${reason}` });
+    if (pr.blocked) return interaction.editReply({ content: `🚫 ${pr.error}` });
+    if (pr.skipped) return interaction.editReply({ content: "❌ حط عدد نقاط صحيح (مو صفر)." });
+    await logEvent({ action: pr.applied ? "تعديل نقاط (بوت الأوامر)" : "طلب تعديل نقاط (بوت الأوامر)", discordId: session.targetId, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${delta >= 0 ? "+" : ""}${delta} — ${reason}` });
+    if (pr.applied) {
+        await checkAutoPromotion(session.targetId);
+        return interaction.editReply({ content: `✅ تم تعديل النقاط (${delta >= 0 ? "+" : ""}${delta}).` });
+    }
+    await interaction.editReply({ content: "✅ تم إرسال طلب النقاط، بانتظار موافقة الإدارة." });
+}
 
 async function handleLeaveCommand(interaction) {
     await interaction.deferReply();
-    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🌴 لوحة طلب الإجازة العسكرية").setDescription(
         "لكل عسكري رصيد إجازات ثابت (10 أيام)، ينقص مع كل إجازة تُقبل ولا يتجدد إلا بتعديل الإدارة يدوياً.\n\n" +
@@ -1207,7 +1414,6 @@ async function handleLeaveModal(interaction) {
 
 async function handlePersonnelCommand(interaction) {
     await interaction.deferReply();
-    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🪪 لوحة تحكم الأفراد").setDescription(
         "من هنا يقدر أي عسكري يشوف بطاقته العسكرية أو مخالفاته الخاصة.\n\n" +
@@ -1253,7 +1459,6 @@ async function handlePersonnelViolations(interaction) {
 
 async function handleAttendanceCommand(interaction) {
     await interaction.deferReply();
-    if (!(await isAnyAdmin(interaction.user.id))) return interaction.editReply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط." });
     const embed = brandEmbed().setTitle("🕒 لوحة تسجيل الحضور والانصراف").setDescription("لتسجيل الدخول والخروج من الخدمة — متاحة لجميع الأفراد بدون استثناء.");
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("att_in").setLabel("🟢 تسجيل دخول").setStyle(ButtonStyle.Success),
@@ -1403,6 +1608,11 @@ client.on("interactionCreate", async interaction => {
             const btnMap = {
                 viol_start: handleViolationStart,
                 cmd_start: handleCommandStart,
+                cmd_warn_start: handleCommandWarnStart,
+                cmd_note_start: handleCommandNoteStart,
+                cmd_points_start: handleCommandPointsStart,
+                cmd_notice_start: handleCommandNoticeStart,
+                cmd_reception: handleCommandReceptionButton,
                 cmd_dir_up: handleCommandDirectionButton,
                 cmd_dir_down: handleCommandDirectionButton,
                 leave_start: handleLeaveStart,
@@ -1440,6 +1650,9 @@ client.on("interactionCreate", async interaction => {
                 return interaction.reply({ content: "✅ تم رفض المخالفة وحفظ السبب.", ephemeral: true });
             }
             if (interaction.customId === "cmd_reason_modal") return handleCommandReasonModal(interaction);
+            if (interaction.customId === "cmd_warnnotice_modal") return handleCommandWarnNoticeModal(interaction);
+            if (interaction.customId === "cmd_note_modal") return handleCommandNoteModal(interaction);
+            if (interaction.customId === "cmd_points_modal") return handleCommandPointsModal(interaction);
             if (interaction.customId === "leave_modal") return handleLeaveModal(interaction);
             return;
         }
@@ -1766,11 +1979,14 @@ app.get("/api/ops-stats", ensureAuth, async (req, res) => {
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
+    // موظف بالإدارة عبر "توظيف الإدارة" يصير مصرح له دخول الموقع تلقائياً، نفس كبار المسؤولين
+    const hiredAdmin = !senior && (settings.adminList || []).includes(req.user.id);
+    const bypassGates = senior || hiredAdmin;
     let isAntiDrugs = false;
     await autoEndActiveLeave(req.user.id).catch(e => console.error("❌ فشل فحص إنهاء الإجازة التلقائي:", e.message));
 
-    // كبار المسؤولين يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة
-    if (!senior) {
+    // كبار المسؤولين وموظفو الإدارة يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة أو ماعندهم رتبة عسكرية
+    if (!bypassGates) {
         if (settings.disableLogin) {
             return res.json({ blocked: true, reason: "🔒 تسجيل الدخول مغلق حالياً من قبل الإدارة العليا." });
         }
@@ -1783,7 +1999,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         }
         isAntiDrugs = !!check.isAntiDrugs;
     } else {
-        // نتحقق من الرول حتى لو كبير مسؤول، فقط عشان نعرف إذا يشوف واجهة تقارير مكافحة المخدرات
+        // نتحقق من الرول حتى لو كبير مسؤول/موظف إدارة، فقط عشان نعرف إذا يشوف واجهة تقارير مكافحة المخدرات
         const check = await isMilitary(req.user.id);
         isAntiDrugs = !!check.isAntiDrugs;
     }
@@ -1791,6 +2007,15 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     let p = await Personnel.findOne({ discord: req.user.id });
     if (!p) p = await Personnel.create({ discord: req.user.id, discordTag: req.user.username, leaveBalance: settings.leaveBalanceDefault ?? CONFIG.DEFAULT_LEAVE_BALANCE });
     p = await autoUnblockIfExpired(p); // فك الإيقاف تلقائيًا لو انتهت مدة عقوبة تحذير مؤقتة
+
+    // مزامنة الرتبة تلقائياً من رول الديسكورد لو كبار المسؤولين عبّوا آيديات رتب بالإعدادات
+    const detectedRank = await detectRankFromRoles(req.user.id, settings);
+    if (detectedRank && detectedRank !== p.rank) {
+        const oldRank = p.rank;
+        p.rank = detectedRank;
+        await p.save();
+        await logEvent({ action: "مزامنة رتبة تلقائية من الرول", discordId: p.discord, discordTag: p.discordTag, actorId: "system", actorTag: "النظام", details: `${oldRank || "-"} ← ${detectedRank} (حسب رول الديسكورد)` });
+    }
 
     if (!senior && p.isBlocked) {
         if (p.isDismissed) {
@@ -2168,6 +2393,92 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
     const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
     if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
+});
+
+// ── طلبات النقاط المعلّقة (أي نقاط منحها/خصمها شخص غير إداري — قائد/نائب قطاع، مسؤول أفراد، قيادة شرطة عسكرية...) ──
+// متاحة لأي إداري (كبير مسؤول أو من قائمة الإدارة)
+app.get("/api/admin/points-requests/pending", ensureAnyAdmin, async (req, res) => {
+    const list = await PointsRequest.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200);
+    res.json({ list });
+});
+app.get("/api/admin/points-requests/reviewed", ensureAnyAdmin, async (req, res) => {
+    const list = await PointsRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(200);
+    res.json({ list });
+});
+app.post("/api/admin/points-requests/:id/approve", ensureAnyAdmin, async (req, res) => {
+    const r = await PointsRequest.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود أو تمت مراجعته" });
+    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    const p = await Personnel.findOneAndUpdate({ discord: r.targetDiscord }, { $inc: { points: r.delta } }, { new: true });
+    if (p && p.points < 0) { p.points = 0; await p.save(); }
+    if (p) await checkAutoPromotion(r.targetDiscord);
+    await logEvent({ action: "قبول طلب نقاط", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: req.user.username, details: `${r.delta >= 0 ? "+" : ""}${r.delta} — ${r.reason} (طالب الطلب: ${r.requestedByTag})` });
+    if (p) dmMember(r.targetDiscord, new EmbedBuilder()
+        .setTitle(r.delta >= 0 ? "✅ تمت الموافقة على نقاطك" : "⚠️ تم تأكيد خصم نقاط")
+        .setColor(r.delta >= 0 ? 0x22c55e : 0xef4444)
+        .addFields({ name: "التفاصيل", value: r.reason || "-" }, { name: "النقاط", value: `${r.delta >= 0 ? "+" : ""}${r.delta}` })
+        .setTimestamp()).catch(() => {});
+    res.json({ ok: true, personnel: p });
+});
+app.post("/api/admin/points-requests/:id/reject", ensureAnyAdmin, async (req, res) => {
+    const { reason } = req.body;
+    const r = await PointsRequest.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود أو تمت مراجعته" });
+    r.status = "rejected"; r.rejectReason = (reason || "").trim() || null; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await logEvent({ action: "رفض طلب نقاط", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: req.user.username, details: `${r.delta >= 0 ? "+" : ""}${r.delta} — ${r.reason} — رُفض من ${req.user.username}${reason ? " — السبب: " + reason.trim() : ""}` });
+    res.json({ ok: true });
+});
+
+// ── صفحة بحث الأفراد بلوحة كبار المسؤولين/الإدارة — بديل تبويبات القطاعات/الحسابات/المركبات/الملاحظات ──
+// بحث فقط (مو قائمة كاملة) + إجراءات فورية بدون موافقة لأنهم أصلاً إداريين: ترقية/تنزيل/نقاط/تحذير
+app.get("/api/admin/personnel/search", ensureAnyAdmin, async (req, res) => {
+    const q = (req.query.q || "").trim();
+    if (q.length < 2) return res.json({ list: [] });
+    const filter = { $or: [{ registeredName: new RegExp(q, "i") }, { unit: new RegExp(q, "i") }, { discordTag: new RegExp(q, "i") }, { discord: q }] };
+    const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(15);
+    res.json({ list });
+});
+app.post("/api/admin/personnel/:discord/rank-direct", ensureAnyAdmin, async (req, res) => {
+    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
+    const { direction } = req.body;
+    if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const idx = rankIndex(p.rank);
+    const newIdx = direction === "up" ? idx + 1 : idx - 1;
+    if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
+    const fromRank = p.rank;
+    p.rank = CONFIG.MILITARY_RANKS[newIdx];
+    p.points = 0;
+    await p.save();
+    await logEvent({ action: direction === "up" ? "ترقية مباشرة (بحث الأفراد)" : "تنزيل مباشر (بحث الأفراد)", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${fromRank} ← ${p.rank}` });
+    dmMember(p.discord, new EmbedBuilder().setTitle(direction === "up" ? "⬆️ تمت ترقيتك" : "⬇️ تم تنزيل رتبتك").setColor(direction === "up" ? 0x22c55e : 0xef4444).addFields({ name: "الرتبة الجديدة", value: p.rank }).setTimestamp()).catch(() => {});
+    res.json({ ok: true, personnel: p });
+});
+app.post("/api/admin/personnel/:discord/points-direct", ensureAnyAdmin, async (req, res) => {
+    const { delta, reason } = req.body;
+    const d = parseInt(delta, 10);
+    if (isNaN(d) || d === 0) return res.status(400).json({ error: "حط عدد نقاط صحيح" });
+    const pr = await applyOrQueuePoints({ discordId: req.params.discord, delta: d, actorId: req.user.id, actorTag: req.user.username, source: "manual", reason: (reason || "").trim() || "تعديل نقاط (بحث الأفراد)" });
+    if (pr.blocked) return res.status(403).json({ error: pr.error });
+    if (!pr.applied) return res.status(500).json({ error: "تعذر تنفيذ العملية" });
+    await checkAutoPromotion(req.params.discord);
+    await logEvent({ action: "تعديل نقاط مباشر (بحث الأفراد)", discordId: req.params.discord, actorId: req.user.id, actorTag: req.user.username, details: `${d >= 0 ? "+" : ""}${d} — ${(reason || "").trim()}` });
+    res.json({ ok: true, personnel: pr.personnel });
+});
+app.post("/api/admin/personnel/:discord/warning-direct", ensureAnyAdmin, async (req, res) => {
+    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر تسوي هذا الإجراء على نفسك." });
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب السبب" });
+    try {
+        const { p, dismissed } = await issueWarning({ targetDiscord: req.params.discord, kind: "warning", reason: reason.trim(), actorId: req.user.id, actorTag: req.user.username });
+        dmMember(req.params.discord, new EmbedBuilder().setTitle("⚠️ تلقيت تحذيراً").setColor(0xef4444).setDescription(reason.trim()).setTimestamp()).catch(() => {});
+        res.json({ ok: true, personnel: p, dismissed });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
 });
 
 // ── مسارات كبار المسؤولين فقط ────────────────────────────────────────────
@@ -2609,11 +2920,22 @@ async function ensurePointsEditor(req, res, next) {
 app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
     const { points } = req.body;
     if (points === undefined || points === "" || isNaN(parseInt(points))) return res.status(400).json({ error: "حط عدد نقاط صحيح" });
-    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { points: Math.max(0, parseInt(points)) }, { new: true });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "تعديل نقاط", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `النقاط الجديدة: ${p.points}` });
-    await checkAutoPromotion(req.params.discord);
-    res.json({ ok: true, personnel: p });
+    const before = await Personnel.findOne({ discord: req.params.discord });
+    if (!before) return res.status(404).json({ error: "غير موجود" });
+    const newValue = Math.max(0, parseInt(points));
+    const delta = newValue - before.points;
+    const pr = await applyOrQueuePoints({
+        discordId: req.params.discord, delta, actorId: req.user.id, actorTag: req.user.username,
+        source: "manual", reason: `تعديل نقاط يدوي — النقاط الجديدة المطلوبة: ${newValue}`,
+    });
+    if (pr.blocked) return res.status(403).json({ error: pr.error });
+    if (pr.applied) {
+        await logEvent({ action: "تعديل نقاط", discordId: before.discord, discordTag: before.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `النقاط الجديدة: ${pr.personnel.points}` });
+        await checkAutoPromotion(req.params.discord);
+        return res.json({ ok: true, personnel: pr.personnel });
+    }
+    await logEvent({ action: "طلب تعديل نقاط", discordId: before.discord, discordTag: before.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${delta >= 0 ? "+" : ""}${delta} نقطة — بانتظار موافقة الإدارة` });
+    res.json({ ok: true, queued: true, personnel: before, message: "تم إرسال طلب تعديل النقاط لموافقة الإدارة." });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2843,6 +3165,30 @@ app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
 });
 
 // أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر — يقرأها بوت الأوامر مباشرة من نفس قاعدة البيانات
+// آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي (لوحة كبار المسؤولين)
+app.get("/api/senior/rank-role-ids", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    const map = {};
+    for (const rank of CONFIG.MILITARY_RANKS) map[rank] = (settings.rankRoleIds && settings.rankRoleIds.get(rank)) || "";
+    res.json({ ranks: CONFIG.MILITARY_RANKS, rankRoleIds: map });
+});
+app.post("/api/senior/rank-role-ids", ensureSeniorAdmin, async (req, res) => {
+    const { rankRoleIds } = req.body;
+    if (!rankRoleIds || typeof rankRoleIds !== "object") return res.status(400).json({ error: "بيانات غير صالحة" });
+    const s = await getSettings();
+    for (const rank of CONFIG.MILITARY_RANKS) {
+        const val = rankRoleIds[rank];
+        if (typeof val === "string") {
+            if (val.trim()) s.rankRoleIds.set(rank, val.trim());
+            else s.rankRoleIds.delete(rank);
+        }
+    }
+    s.markModified("rankRoleIds");
+    await s.save();
+    await logEvent({ action: "تعديل آيديات رتب العسكرية", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(rankRoleIds) });
+    res.json({ ok: true });
+});
+
 app.get("/api/senior/command-permissions", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ ranks: CONFIG.MILITARY_RANKS, permissions: settings.commandPermissions });
@@ -3053,6 +3399,7 @@ app.get("/api/sector/personnel/:discord", ensureSectorLeader, async (req, res) =
 // ترقية أو تنزيل عضو من القطاع رتبة واحدة
 // طلب ترقية/تنزيل من قائد/نائب القطاع — ما ينفّذ مباشرة، يروح كطلب معلّق للقيادة العليا (لازم سبب)
 app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, res) => {
+    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const { direction, reason } = req.body; // 'up' | 'down'
     if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
@@ -3441,6 +3788,7 @@ app.post("/api/personnel-officer/personnel/:discord/warn", ensurePersonnelOffice
 
 // طلب ترقية/تنزيل — ما يصير مباشر، يروح كطلب معلّق لقائد/نائب القطاع
 app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePersonnelOfficer, async (req, res) => {
+    if (req.params.discord === req.user.id) return res.status(403).json({ error: "ما تقدر ترقي أو تنزل نفسك." });
     const p = await ensureJuniorInMySector(req, res, req.params.discord);
     if (!p) return;
     const { direction, reason } = req.body;
@@ -3745,9 +4093,14 @@ app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
         reviewedByTag: isLeader ? req.user.username : undefined,
         reviewedAt: isLeader ? new Date() : undefined,
     });
+    let mpPr = null;
     if (isLeader) {
-        await Personnel.findOneAndUpdate({ discord: req.user.id }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
-        await checkAutoPromotion(req.user.id);
+        // القائد/النائب ما يقدر يعطي نفسه نقاط — تقريره ينقبل تلقائياً بس النقاط تنحط بطلب معلّق لأي إداري
+        mpPr = await applyOrQueuePoints({
+            discordId: req.user.id, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
+            source: "mp-report", reason: "تقرير شرطة عسكرية (قيادة) — قبول ذاتي",
+        });
+        if (mpPr.applied) await checkAutoPromotion(req.user.id);
         // لو النائب هو اللي قدّم، يوصل إشعار للقائد بتقريره
         if (mpRole === "deputy" && settings.mpLeadership?.commanderId) {
             await Personnel.findOneAndUpdate({ discord: settings.mpLeadership.commanderId }, { $push: { warnings: {
@@ -3757,7 +4110,7 @@ app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
             } } });
         }
     }
-    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + (isLeader ? " (قيادة الشرطة العسكرية)" : " (شرطة عسكرية)"), details: isLeader ? "تقرير مقبول تلقائياً" : "تقرير جديد بانتظار المراجعة" });
+    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + (isLeader ? " (قيادة الشرطة العسكرية)" : " (شرطة عسكرية)"), details: isLeader ? (mpPr?.queued ? "تقرير مقبول تلقائياً — النقاط بانتظار موافقة الإدارة" : "تقرير مقبول تلقائياً") : "تقرير جديد بانتظار المراجعة" });
     res.json({ ok: true, report: doc });
 });
 app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
@@ -3774,9 +4127,12 @@ app.post("/api/mp/reports/:id/approve", ensureMPLeader, async (req, res) => {
     if (!r || r.status === "approved") return res.status(404).json({ error: "غير موجود أو مقبول أصلاً" });
     r.status = "approved"; r.rejectReason = null; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
     await r.save();
-    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
-    await checkAutoPromotion(r.reporterDiscord);
-    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة` });
+    const mpPr2 = await applyOrQueuePoints({
+        discordId: r.reporterDiscord, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
+        source: "mp-report", reason: `قبول تقرير شرطة عسكرية — ${r.reporterName || r.reporterTag}`,
+    });
+    if (mpPr2.applied) await checkAutoPromotion(r.reporterDiscord);
+    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة${mpPr2.queued ? " (بانتظار موافقة الإدارة)" : ""}` });
     res.json({ ok: true });
 });
 app.post("/api/mp/reports/:id/reject", ensureMPLeader, async (req, res) => {
@@ -3854,9 +4210,12 @@ app.post("/api/mp/po/reports/:id/approve", ensureMPPersonnelOfficer, async (req,
     if (!r || r.status !== "pending" || excludeIds.includes(r.reporterDiscord)) return res.status(404).json({ error: "غير موجود" });
     r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
     await r.save();
-    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
-    await checkAutoPromotion(r.reporterDiscord);
-    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة` });
+    const mpPr3 = await applyOrQueuePoints({
+        discordId: r.reporterDiscord, delta: CONFIG.MP_REPORT_POINTS_APPROVE, actorId: req.user.id, actorTag: req.user.username,
+        source: "mp-report", reason: `قبول تقرير شرطة عسكرية — ${r.reporterName || r.reporterTag}`,
+    });
+    if (mpPr3.applied) await checkAutoPromotion(r.reporterDiscord);
+    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة${mpPr3.queued ? " (بانتظار موافقة الإدارة)" : ""}` });
     res.json({ ok: true });
 });
 app.post("/api/mp/po/reports/:id/reject", ensureMPPersonnelOfficer, async (req, res) => {
@@ -5076,20 +5435,20 @@ function renderAdmin() {
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
             <div class="tab" onclick="adminTab('reviewed', this)">✅ المخالفات المقبولة</div>
-            <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
-            <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
-            <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
+            <div class="tab" onclick="adminTab('search', this)">🔍 بحث الأفراد</div>
+            <div class="tab" onclick="adminTab('points-requests', this)">⏳ نقاط معلّقة</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
-            <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
+            <div class="tab" onclick="adminTab('search', this)">🔍 بحث الأفراد</div>
+            <div class="tab" onclick="adminTab('points-requests', this)">⏳ نقاط معلّقة</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -5106,15 +5465,13 @@ function adminTab(name, el) {
     currentAdminTab = name;
     if (name === 'pending') loadPending();
     if (name === 'reviewed') loadReviewedViolations();
-    if (name === 'sectors') loadSectors();
-    if (name === 'personnel') loadPersonnel();
-    if (name === 'vehicles') loadVehicles();
+    if (name === 'search') loadPersonnelSearchPage();
+    if (name === 'points-requests') loadPointsRequestsPage();
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
     if (name === 'promotions') loadAdminPromotionsPage();
     if (name === 'log') loadLog();
-    if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
 }
 // تبويب طلبات الترقية/التنزيل بلوحة الإدارة — يعرضها لأي إداري (وليس فقط القيادة العليا)، ويسمح له بالبت فيها
@@ -6859,6 +7216,97 @@ async function loadAdminsList() {
 function fireAdmin(id) {
     api('/api/senior/fire-admin', { method: 'POST', body: JSON.stringify({ discordId: id }) }).then(() => { toast('تم الفصل'); loadHire(); });
 }
+// صفحة بحث الأفراد — بحث فقط (مو قائمة كاملة)، مع إجراءات فورية: ترقية/تنزيل/نقاط/تحذير
+let personnelSearchTimer = null;
+async function loadPersonnelSearchPage() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = \`
+        <div class="card">
+            <h3>🔍 بحث الأفراد</h3>
+            <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">اكتب اسم أو يونت أو تاق ديسكورد (حرفين فأكثر) — ما تطلع القائمة كاملة، لازم تبحث عن الشخص.</p>
+            <input id="psearch-q" placeholder="ابحث..." oninput="onPersonnelSearchInput()">
+        </div>
+        <div id="psearch-results"></div>\`;
+}
+function onPersonnelSearchInput() {
+    clearTimeout(personnelSearchTimer);
+    personnelSearchTimer = setTimeout(runPersonnelSearch, 350);
+}
+async function runPersonnelSearch() {
+    const q = document.getElementById('psearch-q')?.value.trim() || '';
+    const box = document.getElementById('psearch-results');
+    if (!box) return;
+    if (q.length < 2) { box.innerHTML = ''; return; }
+    box.innerHTML = '<div class="card center" style="color:var(--muted);">جارِ البحث...</div>';
+    let list;
+    try { ({ list } = await api('/api/admin/personnel/search?q=' + encodeURIComponent(q))); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر البحث (\${e.message})</div>\`; return; }
+    if (document.getElementById('psearch-q')?.value.trim() !== q) return; // تجاوزه بحث أحدث
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا نتائج</div>'; return; }
+    box.innerHTML = list.map(p => \`
+        <div class="card" id="prow-\${p.discord}">
+            <div><b>\${p.registeredName || p.discordTag || p.discord}</b> <span style="color:var(--muted);font-size:12px;">(\${p.discordTag || '-'})</span></div>
+            <div style="font-size:12px;color:var(--gold-soft);margin:4px 0;">الرتبة: \${p.rank} — اليونت: \${p.unit || '-'} — النقاط: \${p.points}</div>
+            <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px;">
+                <button class="btn sm" onclick="psAction('\${p.discord}','up')">⬆️ ترقية</button>
+                <button class="btn sm gray" onclick="psAction('\${p.discord}','down')">⬇️ تنزيل</button>
+                <button class="btn sm" onclick="psPoints('\${p.discord}')">⭐ نقاط</button>
+                <button class="btn sm danger" onclick="psWarn('\${p.discord}')">⚠️ تحذير</button>
+            </div>
+        </div>\`).join('');
+}
+async function psAction(discord, direction) {
+    if (!confirm(direction === 'up' ? 'تأكيد الترقية؟' : 'تأكيد التنزيل؟')) return;
+    try {
+        const { personnel } = await api('/api/admin/personnel/' + discord + '/rank-direct', { method: 'POST', body: JSON.stringify({ direction }) });
+        toast('تم');
+        runPersonnelSearch();
+    } catch (e) { toast(e.message); }
+}
+function psPoints(discord) {
+    const delta = prompt('عدد النقاط (استخدم - للخصم):');
+    if (delta === null || delta.trim() === '') return;
+    const reason = prompt('السبب:') || '';
+    api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta: parseInt(delta, 10), reason }) })
+        .then(() => { toast('تم'); runPersonnelSearch(); }).catch(e => toast(e.message));
+}
+function psWarn(discord) {
+    const reason = prompt('سبب التحذير:');
+    if (!reason || !reason.trim()) return;
+    api('/api/admin/personnel/' + discord + '/warning-direct', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم تسجيل التحذير'); runPersonnelSearch(); }).catch(e => toast(e.message));
+}
+// طابور النقاط المعلّقة — أي نقاط منحها/خصمها شخص غير إداري تنتظر هنا موافقة أي إداري
+async function loadPointsRequestsPage() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/admin/points-requests/pending')); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
+    if (currentAdminTab !== 'points-requests') return;
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات نقاط معلّقة حالياً</div>'; return; }
+    box.innerHTML = list.map(r => \`
+        <div class="card" id="pr-\${r._id}">
+            <div><b>\${r.targetName || r.targetTag || r.targetDiscord}</b> — \${r.delta >= 0 ? '+' : ''}\${r.delta} نقطة</div>
+            <div style="font-size:12px;color:var(--muted);margin:4px 0;">\${r.reason || '-'}</div>
+            <div style="font-size:11px;color:var(--muted);">طلبها: \${r.requestedByTag || r.requestedBy}</div>
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="approvePointsRequest('\${r._id}')">✅ موافقة</button>
+                <button class="btn sm danger" onclick="rejectPointsRequest('\${r._id}')">❌ رفض</button>
+            </div>
+        </div>\`).join('');
+}
+async function approvePointsRequest(id) {
+    try { await api('/api/admin/points-requests/' + id + '/approve', { method: 'POST' }); toast('تمت الموافقة'); loadPointsRequestsPage(); }
+    catch (e) { toast(e.message); }
+}
+async function rejectPointsRequest(id) {
+    const reason = prompt('سبب الرفض (اختياري):') || '';
+    try { await api('/api/admin/points-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) }); toast('تم الرفض'); loadPointsRequestsPage(); }
+    catch (e) { toast(e.message); }
+}
 async function loadThresholds() {
     const { ranks, thresholds } = await api('/api/senior/thresholds');
     if (currentAdminTab !== 'thresholds') return;
@@ -7210,8 +7658,33 @@ async function loadSettings() {
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>
-        <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>\`;
+        <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>
+        <div class="card" id="rank-role-card">جارِ تحميل آيديات رتب العسكرية...</div>\`;
     loadCommandPermissions();
+    loadRankRoleIds();
+}
+// آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي
+async function loadRankRoleIds() {
+    let data;
+    try { data = await api('/api/senior/rank-role-ids'); } catch (e) { return; }
+    if (currentAdminTab !== 'settings') return;
+    const box = document.getElementById('rank-role-card');
+    if (!box) return;
+    box.innerHTML = \`
+        <h3 style="margin-bottom:10px;">🎖️ آيديات رولات الرتب العسكرية</h3>
+        <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">حط آيدي رول الديسكورد حق كل رتبة — أي عضو معه الرول يتسجل تلقائياً أن رتبته هذي أول ما يدخل الموقع (اختياري، اتركه فاضي لو ما تبي هذي الرتبة).</p>
+        \${data.ranks.map(r => \`
+            <label style="margin-top:8px;">\${r}</label>
+            <input id="rr-\${r}" placeholder="آيدي الرول" value="\${data.rankRoleIds[r] || ''}">\`).join('')}
+        <button class="btn" style="margin-top:14px;" onclick="saveRankRoleIds()">حفظ آيديات الرتب</button>\`;
+}
+async function saveRankRoleIds() {
+    const body = { rankRoleIds: {} };
+    document.querySelectorAll('[id^="rr-"]').forEach(el => {
+        body.rankRoleIds[el.id.slice(3)] = el.value.trim();
+    });
+    try { await api('/api/senior/rank-role-ids', { method: 'POST', body: JSON.stringify(body) }); toast('تم الحفظ'); }
+    catch (e) { toast(e.message); }
 }
 // أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر (مركز العمليات) — بوت الأوامر يقرأها مباشرة من نفس القاعدة
 async function loadCommandPermissions() {
