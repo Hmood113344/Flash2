@@ -6826,10 +6826,47 @@ async function psAction(discord, direction) {
     } catch (e) { toast(e.message); }
 }
 function psPoints(discord) {
-    const delta = prompt('عدد النقاط (استخدم - للخصم):');
-    if (delta === null || delta.trim() === '') return;
-    const reason = prompt('السبب:') || '';
-    api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta: parseInt(delta, 10), reason }) })
+    const card = document.getElementById('psr-' + discord);
+    if (!card || document.getElementById('pp-form-' + discord)) return;
+    const form = document.createElement('div');
+    form.id = 'pp-form-' + discord;
+    form.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.12);';
+    form.innerHTML = ''
+        + '<div class="row" style="gap:6px;">'
+        + '<button type="button" class="btn sm" id="pp-inc-' + discord + '" onclick="ppSetType(\'' + discord + '\',\'inc\')">➕ زيادة</button>'
+        + '<button type="button" class="btn sm gray" id="pp-dec-' + discord + '" onclick="ppSetType(\'' + discord + '\',\'dec\')">➖ نقص</button>'
+        + '</div>'
+        + '<input id="pp-amount-' + discord + '" type="number" min="1" inputmode="numeric" placeholder="عدد النقاط" style="margin-top:8px;">'
+        + '<input id="pp-reason-' + discord + '" placeholder="السبب (اختياري)" style="margin-top:8px;">'
+        + '<div class="row" style="gap:6px;margin-top:8px;">'
+        + '<button type="button" class="btn sm" onclick="ppSubmit(\'' + discord + '\')">تأكيد</button>'
+        + '<button type="button" class="btn sm gray" onclick="ppCancel(\'' + discord + '\')">إلغاء</button>'
+        + '</div>';
+    card.appendChild(form);
+    card.dataset.ppType = 'inc';
+    ppSetType(discord, 'inc');
+}
+function ppSetType(discord, type) {
+    const card = document.getElementById('psr-' + discord);
+    if (card) card.dataset.ppType = type;
+    const incBtn = document.getElementById('pp-inc-' + discord);
+    const decBtn = document.getElementById('pp-dec-' + discord);
+    if (incBtn) incBtn.className = 'btn sm' + (type === 'inc' ? '' : ' gray');
+    if (decBtn) decBtn.className = 'btn sm' + (type === 'dec' ? '' : ' gray');
+}
+function ppCancel(discord) {
+    const form = document.getElementById('pp-form-' + discord);
+    if (form) form.remove();
+}
+function ppSubmit(discord) {
+    const card = document.getElementById('psr-' + discord);
+    const type = (card && card.dataset.ppType) || 'inc';
+    const amountEl = document.getElementById('pp-amount-' + discord);
+    const amount = parseInt(amountEl.value, 10);
+    if (!amount || amount <= 0) return toast('اكتب عدد نقاط صحيح');
+    const delta = type === 'inc' ? amount : -amount;
+    const reason = (document.getElementById('pp-reason-' + discord).value || '').trim();
+    api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta, reason }) })
         .then(() => { toast('تم'); refreshPersonnelViews(); }).catch(e => toast(e.message));
 }
 function psWarn(discord) {
