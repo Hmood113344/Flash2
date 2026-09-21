@@ -404,6 +404,14 @@ const SettingsSchema = new mongoose.Schema({
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
+    // آيديات رولات ديسكورد للقطاعات الثلاثة — يحددها كبار المسؤولين من الإعدادات (لو فاضية نستخدم الافتراضي من CONFIG)
+    sectorRoleIds: {
+        patrol: { type: String, default: null },
+        roadSecurity: { type: String, default: null },
+        antiDrugs: { type: String, default: null },
+    },
+    // علامة تصفير اللوق الشامل لمرة وحدة (عشان ما يتكرر المسح مع كل تشغيل)
+    logWipeTag: { type: String, default: null },
     // القيادة العليا — مجموعة يعيّنها كبار المسؤولين، وظيفتها الوحيدة مراجعة طلبات الترقية/التنزيل
     highCommand: { type: [{ id: String, name: String }], default: [] },
     violationsChannelId: String,
@@ -439,6 +447,22 @@ async function getSettings() {
 
 async function logEvent({ action, discordId = null, discordTag = null, actorId = null, actorTag = null, site = "فلاش", accountNumber = null, details = "" }) {
     try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { /* تجاهل */ }
+}
+
+// تصفير اللوق الشامل لمرة وحدة فقط (بطلب الإدارة) — يتحدد بعلامة محفوظة بالإعدادات، فما يتكرر مع كل تشغيل
+const LOG_WIPE_TAG = "wipe-2026-09-21";
+async function runOneTimeLogWipe() {
+    const st = await getSettings();
+    if (st.logWipeTag === LOG_WIPE_TAG) return;
+    const result = await Log.deleteMany({});
+    st.logWipeTag = LOG_WIPE_TAG;
+    await st.save();
+    await logEvent({ action: "مسح اللوق الشامل بالكامل", actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي", details: `تم حذف ${result.deletedCount} سجل (تصفير لمرة وحدة عند التحديث)` });
+    console.log(`🧹 تم تصفير اللوق الشامل (${result.deletedCount} سجل)`);
+}
+{
+    const startWipe = () => runOneTimeLogWipe().catch(e => console.error("❌ فشل تصفير اللوق:", e.message));
+    if (mongoose.connection.readyState === 1) startWipe(); else mongoose.connection.once("open", startWipe);
 }
 
 function generatePlate() {
@@ -617,6 +641,27 @@ function getMPRole(userId, settings) {
 function isMPPersonnelOfficer(userId, settings) {
     return false;
 }
+// قائد/نائب قطاع (يعيّنهم كبار المسؤولين بالآيدي من صفحة "قادة القطاعات") — صلاحيتهم على أزرار /تحكم-قياده بقطاعهم فقط
+function getSectorLeaderInfo(userId, settings) {
+    const sl = (settings && settings.sectorLeadership) || {};
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = sl[key];
+        if (!sec) continue;
+        if (sec.commanderId && sec.commanderId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "commander" };
+        if (sec.deputyId && sec.deputyId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "deputy" };
+    }
+    return null;
+}
+// هل هذا الشخص من أعضاء القطاع؟ (حسب رول القطاع بديسكورد)
+async function targetInSector(targetId, sectorKey, settings) {
+    const roleId = sectorRoleId(sectorKey, settings);
+    if (!roleId || !botReady) return false;
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const member = await guild.members.fetch(targetId);
+        return member.roles.cache.has(roleId);
+    } catch (e) { return false; }
+}
 // القيادة العليا — مجموعة يعيّنها كبار المسؤولين لمراجعة طلبات الترقية/التنزيل بكل القطاعات
 function isHighCommand(userId, settings) {
     return !!(settings.highCommand || []).find(m => m.id === userId);
@@ -637,7 +682,10 @@ function isSummonBlocking(p) {
     return !!(p && p.summon && p.summon.status === "approved");
 }
 
-function sectorRoleId(sectorKey) {
+function sectorRoleId(sectorKey, settings) {
+    // آيدي الرول اللي حدده كبار المسؤولين من الإعدادات له الأولوية، وإلا نرجع للقيمة الافتراضية
+    const custom = settings && settings.sectorRoleIds && settings.sectorRoleIds[sectorKey];
+    if (custom && String(custom).trim()) return String(custom).trim();
     if (sectorKey === "patrol") return CONFIG.PATROL_ROLE_ID;
     if (sectorKey === "roadSecurity") return CONFIG.ROAD_SECURITY_ROLE_ID;
     if (sectorKey === "antiDrugs") return CONFIG.ANTI_DRUGS_ROLE_ID;
@@ -659,7 +707,7 @@ async function ensureGuildMembersFetched(guild) {
 }
 // يرجع مصفوفة آيديات لو نجح، أو null لو صار خطأ فعلي بالجلب (عشان ما نلخبط "فشل" مع "لا يوجد أعضاء")
 async function getSectorMemberIds(sectorKey) {
-    const roleId = sectorRoleId(sectorKey);
+    const roleId = sectorRoleId(sectorKey, await getSettings());
     if (!roleId) return [];
     if (!botReady) return null;
     try {
@@ -727,7 +775,7 @@ async function isMilitary(discordId) {
         const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
         const member = await guild.members.fetch(discordId);
         const has = member.roles.cache.some(r => CONFIG.MILITARY_ROLE_IDS.includes(r.id));
-        const isAntiDrugs = member.roles.cache.has(CONFIG.ANTI_DRUGS_ROLE_ID);
+        const isAntiDrugs = member.roles.cache.has(sectorRoleId("antiDrugs", await getSettings()));
         return { ok: has, member, isAntiDrugs };
     } catch (e) {
         console.error("❌ isMilitary خطأ:", e.message);
@@ -1125,8 +1173,9 @@ async function handleCommandCommand(interaction) {
     await interaction.deferReply();
     const settings = await getSettings();
     const embed = brandEmbed().setTitle("🎖️ لوحة تحكم القيادة").setDescription(
-        "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار، ونقاط الاستلام اليومية.\n\n" +
-        `**الرتبة المطلوبة لأغلب الأزرار:** ${settings.commandPermissions.command} فما فوق`);
+        "أوامر القيادة المتاحة لك حسب رتبتك — ترقية/تنزيل، تحذير، ملاحظة، نقاط، إشعار، ونقاط الاستلام (تختار الشخص اللي تعطيه).\n\n" +
+        `**الرتبة المطلوبة لأغلب الأزرار:** ${settings.commandPermissions.command} فما فوق\n` +
+        "**قادة ونواب القطاعات:** يستخدمون الأزرار على أفراد قطاعهم فقط.");
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("cmd_start").setLabel("🎖️ ترقية/تنزيل").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("cmd_warn_start").setLabel("⚠️ تحذير").setStyle(ButtonStyle.Danger),
@@ -1144,10 +1193,17 @@ async function startCommandFlow(interaction, action, placeholder, stepLabel) {
     await interaction.deferReply({ ephemeral: true });
     const settings = await getSettings();
     const p = await getOrCreatePersonnel(interaction.user.id, interaction.member);
+    // الرتبة المطلوبة تعطي صلاحية كاملة، وقائد/نائب القطاع يعطيه صلاحية على أفراد قطاعه فقط
+    let leaderSector = null;
     if (!rankAtLeast(p.rank, settings.commandPermissions.command)) {
-        return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).` });
+        const leader = getSectorLeaderInfo(interaction.user.id, settings);
+        if (!leader) {
+            return interaction.editReply({ content: `🚫 رتبتك الحالية (${p.rank}) أقل من الرتبة المطلوبة (${settings.commandPermissions.command}).` });
+        }
+        leaderSector = leader.sector;
+        stepLabel += `\n\n🎖️ صلاحيتك كـ${leader.role === "commander" ? "قائد" : "نائب"} ${leader.sectorLabel} على أفراد قطاعك فقط.`;
     }
-    cmdSessions.set(interaction.user.id, { action });
+    cmdSessions.set(interaction.user.id, { action, leaderSector });
     const menu = new UserSelectMenuBuilder().setCustomId("cmd_target_select").setPlaceholder(placeholder);
     await interaction.editReply({ content: stepLabel, components: [new ActionRowBuilder().addComponents(menu)] });
 }
@@ -1166,28 +1222,48 @@ async function handleCommandPointsStart(interaction) {
 async function handleCommandNoticeStart(interaction) {
     return startCommandFlow(interaction, "notice", "اختر الفرد المطلوب إرسال إشعار له", "**اختر الفرد**");
 }
-// نقاط الاستلام — يعطيها العضو لنفسه مباشرة، مقيّدة بحد أقصى يومي
+// نقاط الاستلام — أول ما تضغط الزر يطلب منك تختار الشخص اللي تبي تعطيه النقاط، وبعدها تنطبق مباشرة (مقيّدة بحد أقصى يومي لكل شخص)
 async function handleCommandReceptionButton(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    return startCommandFlow(interaction, "reception", "اختر الشخص اللي تبي تعطيه نقاط الاستلام", `**🪖 نقاط الاستلام (+${CONFIG.RECEPTION_POINTS})**\nاختر الشخص اللي تبي تعطيه نقاط الاستلام:`);
+}
+async function finishReception(interaction, session, targetId) {
+    cmdSessions.delete(interaction.user.id);
     const todayStart = new Date(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Riyadh" }).format(new Date()) + "T00:00:00.000+03:00");
-    const countToday = await Log.countDocuments({ action: "نقاط الاستلام", discordId: interaction.user.id, createdAt: { $gte: todayStart } });
+    const countToday = await Log.countDocuments({ action: "نقاط الاستلام", discordId: targetId, createdAt: { $gte: todayStart } });
     if (countToday >= CONFIG.RECEPTION_MAX_PER_DAY) {
-        return interaction.editReply({ content: `🚫 وصلت الحد الأقصى لنقاط الاستلام اليوم (${CONFIG.RECEPTION_MAX_PER_DAY} مرات).` });
+        return interaction.editReply({ content: `🚫 <@${targetId}> وصل الحد الأقصى لنقاط الاستلام اليوم (${CONFIG.RECEPTION_MAX_PER_DAY} مرات).`, components: [] });
     }
-    await applyOrQueuePoints({ discordId: interaction.user.id, delta: CONFIG.RECEPTION_POINTS, actorId: interaction.user.id, actorTag: interaction.user.username, source: "reception", reason: "نقاط الاستلام" });
-    await checkAutoPromotion(interaction.user.id);
-    await logEvent({ action: "نقاط الاستلام", discordId: interaction.user.id, discordTag: interaction.user.username, actorId: interaction.user.id, actorTag: interaction.user.username, details: `+${CONFIG.RECEPTION_POINTS} نقطة (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم)` });
-    await interaction.editReply({ content: `✅ تم إضافة ${CONFIG.RECEPTION_POINTS} نقاط استلام لك (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم).` });
+    const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+    const targetMember = await guild.members.fetch(targetId).catch(() => null);
+    const target = await getOrCreatePersonnel(targetId, targetMember);
+    await applyOrQueuePoints({ discordId: targetId, delta: CONFIG.RECEPTION_POINTS, actorId: interaction.user.id, actorTag: interaction.user.username, source: "reception", reason: "نقاط الاستلام" });
+    await checkAutoPromotion(targetId);
+    await logEvent({ action: "نقاط الاستلام", discordId: targetId, discordTag: target.discordTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `+${CONFIG.RECEPTION_POINTS} نقطة (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم)` });
+    await interaction.editReply({ content: `✅ تم إضافة ${CONFIG.RECEPTION_POINTS} نقاط استلام لـ<@${targetId}> (${countToday + 1}/${CONFIG.RECEPTION_MAX_PER_DAY} اليوم).`, components: [] });
 }
 async function handleCommandTargetSelect(interaction) {
     await interaction.deferUpdate();
     const session = cmdSessions.get(interaction.user.id);
     if (!session) return interaction.editReply({ content: "⏱️ انتهت الجلسة، ابدأ من جديد.", components: [] });
     const targetId = interaction.values[0];
-    if (targetId === interaction.user.id) {
+    // نقاط الاستلام يمديك تعطيها لنفسك أو لغيرك (ضمن الحد اليومي)، أما بقية الأزرار فما تقدر تختار نفسك
+    if (session.action !== "reception" && targetId === interaction.user.id) {
         cmdSessions.delete(interaction.user.id);
         return interaction.editReply({ content: "🚫 ما تقدر تختار نفسك.", components: [] });
     }
+    if (interaction.users?.get(targetId)?.bot) {
+        cmdSessions.delete(interaction.user.id);
+        return interaction.editReply({ content: "🚫 ما تقدر تختار بوت.", components: [] });
+    }
+    // قائد/نائب القطاع (اللي صلاحيته جاية من منصبه مو من رتبته) يتحكم بأفراد قطاعه فقط
+    if (session.leaderSector) {
+        const inSector = await targetInSector(targetId, session.leaderSector, await getSettings());
+        if (!inSector) {
+            cmdSessions.delete(interaction.user.id);
+            return interaction.editReply({ content: `🚫 صلاحيتك على أفراد ${CONFIG.SECTORS[session.leaderSector]} فقط، والشخص المختار مو من قطاعك.`, components: [] });
+        }
+    }
+    if (session.action === "reception") return finishReception(interaction, session, targetId);
     const target = await getOrCreatePersonnel(targetId, null);
     session.targetId = targetId;
     session.targetRank = target.rank;
@@ -3000,6 +3076,94 @@ app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
+// ── آيديات رولات القطاعات (دوريات / أمن الطرق / مكافحة المخدرات) — الكبار يحطون أي رول يبغونه ──
+app.get("/api/senior/sector-role-ids", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    const roleIds = {};
+    for (const key of Object.keys(CONFIG.SECTORS)) roleIds[key] = sectorRoleId(key, settings) || "";
+    res.json({ sectors: CONFIG.SECTORS, roleIds });
+});
+app.post("/api/senior/sector-role-ids", ensureSeniorAdmin, async (req, res) => {
+    const { roleIds } = req.body || {};
+    if (!roleIds || typeof roleIds !== "object") return res.status(400).json({ error: "بيانات غير صالحة" });
+    const s = await getSettings();
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        if (typeof roleIds[key] !== "string") continue;
+        const val = roleIds[key].trim();
+        if (val && !/^\d{15,25}$/.test(val)) return res.status(400).json({ error: `آيدي رول ${CONFIG.SECTORS[key]} غير صحيح (أرقام فقط)` });
+        s.sectorRoleIds[key] = val || null;
+    }
+    s.markModified("sectorRoleIds");
+    await s.save();
+    await logEvent({ action: "تعديل آيديات رولات القطاعات", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(roleIds) });
+    res.json({ ok: true });
+});
+
+// ── قادة ونواب القطاعات — يعيّنهم كبار المسؤولين بالآيدي، وكل واحد يكون لقطاع واحد فقط ──
+const SECTOR_LEADER_ROLES = { commander: "قائد", deputy: "نائب" };
+app.get("/api/senior/sector-leaders", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    const leadership = {};
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sl = (settings.sectorLeadership && settings.sectorLeadership[key]) || {};
+        leadership[key] = {
+            commanderId: sl.commanderId || null, commanderName: sl.commanderName || null,
+            deputyId: sl.deputyId || null, deputyName: sl.deputyName || null,
+        };
+    }
+    res.json({ sectors: CONFIG.SECTORS, leadership });
+});
+app.post("/api/senior/sector-leaders/assign", ensureSeniorAdmin, async (req, res) => {
+    const sector = String(req.body?.sector || "").trim();
+    const role = String(req.body?.role || "").trim();
+    const discordId = String(req.body?.discordId || "").replace(/[<@!>\s]/g, "");
+    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير صحيح" });
+    if (!SECTOR_LEADER_ROLES[role]) return res.status(400).json({ error: "المنصب غير صحيح" });
+    if (!/^\d{17,20}$/.test(discordId)) return res.status(400).json({ error: "الآيدي غير صحيح — لازم أرقام فقط (آيدي حساب ديسكورد)" });
+    const s = await getSettings();
+    // الشخص ما يكون قائد/نائب إلا بقطاع واحد ومنصب واحد
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sl = (s.sectorLeadership && s.sectorLeadership[key]) || {};
+        for (const r of Object.keys(SECTOR_LEADER_ROLES)) {
+            if (sl[r + "Id"] === discordId && !(key === sector && r === role)) {
+                return res.status(400).json({ error: `هذا الشخص معيّن أصلاً كـ${SECTOR_LEADER_ROLES[r]} ${CONFIG.SECTORS[key]} — أزله أول قبل ما تعيّنه بمنصب ثاني` });
+            }
+        }
+    }
+    // نجيب اسمه: من سجل الموقع، وإلا من السيرفر عن طريق البوت
+    const per = await Personnel.findOne({ discord: discordId });
+    let name = per?.registeredName || null;
+    if (botReady) {
+        try {
+            const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+            const member = await guild.members.fetch(discordId);
+            name = name || member.displayName || member.user.username;
+        } catch (e) {
+            if (!per) return res.status(404).json({ error: "ما لقيت هذا الآيدي بالسيرفر — تأكد منه" });
+        }
+    }
+    name = name || per?.discordTag || discordId;
+    s.sectorLeadership[sector][role + "Id"] = discordId;
+    s.sectorLeadership[sector][role + "Name"] = name;
+    s.markModified("sectorLeadership");
+    await s.save();
+    await logEvent({ action: "تعيين قيادة قطاع", discordId, discordTag: name, actorId: req.user.id, actorTag: req.user.username, details: `${SECTOR_LEADER_ROLES[role]} ${CONFIG.SECTORS[sector]}` });
+    res.json({ ok: true, name });
+});
+app.post("/api/senior/sector-leaders/remove", ensureSeniorAdmin, async (req, res) => {
+    const sector = String(req.body?.sector || "").trim();
+    const role = String(req.body?.role || "").trim();
+    if (!CONFIG.SECTORS[sector] || !SECTOR_LEADER_ROLES[role]) return res.status(400).json({ error: "بيانات غير صحيحة" });
+    const s = await getSettings();
+    const old = s.sectorLeadership[sector][role + "Id"];
+    s.sectorLeadership[sector][role + "Id"] = null;
+    s.sectorLeadership[sector][role + "Name"] = null;
+    s.markModified("sectorLeadership");
+    await s.save();
+    await logEvent({ action: "إزالة قيادة قطاع", discordId: old || null, actorId: req.user.id, actorTag: req.user.username, details: `${SECTOR_LEADER_ROLES[role]} ${CONFIG.SECTORS[sector]}` });
+    res.json({ ok: true });
+});
+
 // أقل رتبة تقدر تستخدم أزرار كل أمر ببوت الأوامر — يقرأها بوت الأوامر مباشرة من نفس قاعدة البيانات
 // آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي (لوحة كبار المسؤولين)
 app.get("/api/senior/rank-role-ids", ensureSeniorAdmin, async (req, res) => {
@@ -4460,6 +4624,7 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
+            <div class="tab" onclick="adminTab('sector-leaders', this)">🎖️ قادة القطاعات</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
         </div>\` : \`
@@ -4490,6 +4655,7 @@ function adminTab(name, el) {
     if (name === 'leave') loadSeniorLeavePage();
     if (name === 'promotions') loadAdminPromotionsPage();
     if (name === 'log') loadLog();
+    if (name === 'sector-leaders') loadSectorLeaders();
     if (name === 'settings') loadSettings();
 }
 // تبويب طلبات الترقية/التنزيل بلوحة الإدارة — يعرضها لأي إداري (وليس فقط القيادة العليا)، ويسمح له بالبت فيها
@@ -6667,6 +6833,83 @@ async function deletePenalty(id) {
         renderPenaltiesPage(list);
     } catch (e) { toast(e.message); }
 }
+// ── قادة القطاعات: تعيين قائد/نائب لكل قطاع بالآيدي ──
+function escH(v) {
+    return String(v).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+}
+async function loadSectorLeaders() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/senior/sector-leaders'); }
+    catch (e) {
+        if (currentAdminTab !== 'sector-leaders') return;
+        box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + escH(e.message) + ')</div>';
+        return;
+    }
+    if (currentAdminTab !== 'sector-leaders') return;
+    box.innerHTML = '<div class="card" style="color:var(--muted);font-size:13px;">حط آيدي حساب ديسكورد للشخص — يصير قائد أو نائب لهذا القطاع فقط، ويقدر يستخدم أزرار /تحكم-قياده على أفراد قطاعه. الشخص ما يتعيّن بأكثر من قطاع أو منصب.</div>'
+        + Object.keys(data.sectors).map(function (key) {
+            var sec = data.leadership[key] || {};
+            return '<div class="card"><h3>🪖 ' + escH(data.sectors[key]) + '</h3>'
+                + sectorLeaderRow(key, 'commander', 'القائد', sec.commanderName, sec.commanderId)
+                + sectorLeaderRow(key, 'deputy', 'النائب', sec.deputyName, sec.deputyId)
+                + '</div>';
+        }).join('');
+}
+function sectorLeaderRow(key, role, label, name, id) {
+    var attrs = 'data-sector="' + key + '" data-role="' + role + '"';
+    var html = '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">';
+    html += '<div class="row"><span>' + label + ': <b style="color:' + (name ? '#4ade80' : 'var(--muted)') + ';">' + escH(name || 'غير معيّن') + '</b>'
+        + (id ? ' <span style="color:var(--muted);font-size:12px;">(' + escH(id) + ')</span>' : '') + '</span>';
+    if (id) html += '<button class="btn danger sm" ' + attrs + ' onclick="removeSectorLeader(this)">إزالة</button>';
+    html += '</div>';
+    html += '<div class="row" style="gap:6px;margin-top:8px;flex-wrap:nowrap;">'
+        + '<input id="sl-' + key + '-' + role + '" placeholder="آيدي ديسكورد ' + label + '" inputmode="numeric" style="margin-bottom:0;flex:1;">'
+        + '<button class="btn sm" ' + attrs + ' onclick="assignSectorLeader(this)">' + (id ? 'تغيير' : 'تعيين') + '</button></div></div>';
+    return html;
+}
+async function assignSectorLeader(btn) {
+    var key = btn.dataset.sector, role = btn.dataset.role;
+    var input = document.getElementById('sl-' + key + '-' + role);
+    var discordId = ((input && input.value) || '').trim();
+    if (!discordId) return toast('اكتب آيدي الشخص أول');
+    try {
+        await api('/api/senior/sector-leaders/assign', { method: 'POST', body: JSON.stringify({ sector: key, role: role, discordId: discordId }) });
+        toast('تم التعيين');
+        loadSectorLeaders();
+    } catch (e) { toast(e.message); }
+}
+async function removeSectorLeader(btn) {
+    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    try {
+        await api('/api/senior/sector-leaders/remove', { method: 'POST', body: JSON.stringify({ sector: btn.dataset.sector, role: btn.dataset.role }) });
+        toast('تمت الإزالة');
+        loadSectorLeaders();
+    } catch (e) { toast(e.message); }
+}
+// ── آيديات رولات القطاعات (بالإعدادات) ──
+async function loadSectorRoleIds() {
+    var data;
+    try { data = await api('/api/senior/sector-role-ids'); } catch (e) { return; }
+    if (currentAdminTab !== 'settings') return;
+    var box = document.getElementById('sector-role-card');
+    if (!box) return;
+    box.innerHTML = '<h3 style="margin-bottom:10px;">🪖 آيديات رولات القطاعات</h3>'
+        + '<p style="color:var(--muted);font-size:12px;margin-bottom:10px;">حط آيدي رول ديسكورد لكل قطاع (أي رول تبيه) — منه يُعرف أعضاء كل قطاع، وعليه تنبني صلاحية قادة ونواب القطاعات. لو تركته فاضي يرجع للرول الافتراضي.</p>'
+        + Object.keys(data.sectors).map(function (k) {
+            return '<label style="margin-top:8px;">رول ' + escH(data.sectors[k]) + '</label>'
+                + '<input id="sr-' + k + '" placeholder="آيدي الرول" inputmode="numeric" value="' + escH(data.roleIds[k] || '') + '">';
+        }).join('')
+        + '<button class="btn" style="margin-top:14px;" onclick="saveSectorRoleIds()">حفظ آيديات القطاعات</button>';
+}
+async function saveSectorRoleIds() {
+    var roleIds = {};
+    document.querySelectorAll('[id^="sr-"]').forEach(function (el) { roleIds[el.id.slice(3)] = el.value.trim(); });
+    try { await api('/api/senior/sector-role-ids', { method: 'POST', body: JSON.stringify({ roleIds: roleIds }) }); toast('تم الحفظ'); }
+    catch (e) { toast(e.message); }
+}
 async function loadSettings() {
     const { settings } = await api('/api/senior/settings');
     if (currentAdminTab !== 'settings') return;
@@ -6684,8 +6927,10 @@ async function loadSettings() {
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>
         <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>
+        <div class="card" id="sector-role-card">جارِ تحميل آيديات رولات القطاعات...</div>
         <div class="card" id="rank-role-card">جارِ تحميل آيديات رتب العسكرية...</div>\`;
     loadCommandPermissions();
+    loadSectorRoleIds();
     loadRankRoleIds();
 }
 // آيديات رولات الرتب العسكرية — أي شخص معه الرول يتسجل تلقائياً أن رتبته هذي
