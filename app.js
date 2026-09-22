@@ -2934,13 +2934,19 @@ app.post("/api/warnings/:id/ack", async (req, res) => {
 
 // يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
-    const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
+    const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, rank: 1, notes: 1 });
+    // نجيب رتبة كل شخص أعطى ملاحظة (لو كان هو نفسه عسكري مسجّل بالنظام) عشان نعرضها بجنب اسمه
+    const giverIds = [...new Set(list.flatMap(p => p.notes.map(n => n.addedBy).filter(Boolean)))];
+    const givers = giverIds.length ? await Personnel.find({ discord: { $in: giverIds } }, { discord: 1, rank: 1 }) : [];
+    const giverRankMap = new Map(givers.map(g => [g.discord, g.rank]));
     const flat = [];
     for (const p of list) {
         for (const n of p.notes) {
             flat.push({
-                noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord,
-                text: n.text, hasImage: !!(n.image || (n.imageChannelId && n.imageMessageId)), addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+                noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord, personnelRank: p.rank || null,
+                text: n.text, hasImage: !!(n.image || (n.imageChannelId && n.imageMessageId)),
+                addedBy: n.addedBy, addedByTag: n.addedByTag, addedByRank: giverRankMap.get(n.addedBy) || null,
+                createdAt: n.createdAt,
             });
         }
     }
@@ -6988,7 +6994,7 @@ async function loadLog(silent) {
     allLogsData = list;
     if (!document.getElementById('log-search')) {
         box.innerHTML = \`<div class="card"><div class="row" style="gap:8px;align-items:center;">
-            <input id="log-search" placeholder="🔍 ابحث بالاسم، اليوزر، الآيدي، أو نوع الحدث..." oninput="filterLog()" style="flex:1;">
+            <input id="log-search" placeholder="🔍 ابحث بالاسم، اليوزر، الآيدي، أو نوع الحدث..." oninput="filterLog()" style="flex:1;min-width:0;">
             <button class="btn danger sm" onclick="wipeLog()">🗑️ مسح اللوق القديم بالكامل</button>
         </div><div id="log-list" style="margin-top:12px;"></div></div>\`;
     }
@@ -7061,15 +7067,40 @@ async function loadNotesPage() {
     box.innerHTML = sectorButtons + list.map(n => \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
-                <div>
-                    <b>\${n.personnelName}</b>
-                    <div style="margin-top:4px;">\${n.text}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:2px;">سبب الملاحظة</div>
+                    <div>\${escH(n.text)}</div>
                     \${n.hasImage ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${n.discord}','\${n.noteId}')">📷 عرض الصورة</button>\` : ''}
-                    <div style="color:var(--muted);font-size:12px;margin-top:4px;">أضافها: \${n.addedByTag || n.addedBy || '-'} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
+                    <div class="row" style="gap:20px;margin-top:10px;">
+                        <div>
+                            <div style="font-size:12px;color:var(--muted);">أخذ الملاحظة</div>
+                            <b>\${escH(n.personnelName)}</b>
+                            <div style="font-size:12px;color:var(--gold-soft);margin-top:1px;">\${escH(n.personnelRank || '-')}</div>
+                        </div>
+                        <div>
+                            <div style="font-size:12px;color:var(--muted);">أعطى الملاحظة</div>
+                            <b>\${escH(n.addedByTag || n.addedBy || '-')}</b>
+                            <div style="font-size:12px;color:var(--gold-soft);margin-top:1px;">\${escH(n.addedByRank || '-')}</div>
+                        </div>
+                    </div>
+                    <div style="color:var(--muted);font-size:12px;margin-top:8px;">\${formatHijriDateTime(n.createdAt)}</div>
                 </div>
                 <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
             </div>
         </div>\`).join('');
+}
+// يبني نص التاريخ/الوقت الهجري لملاحظة: الساعة/الدقيقة/الثانية + يوم/شهر/سنة هجري
+function formatHijriDateTime(iso) {
+    const d = new Date(iso);
+    try {
+        const parts = new Intl.DateTimeFormat('ar-SA-u-ca-islamic-umalqura-nu-latn', {
+            day: 'numeric', month: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        }).formatToParts(d);
+        const g = t => (parts.find(x => x.type === t) || {}).value || '';
+        return \`🕒 الساعة \${g('hour')}:\${g('minute')}:\${g('second')} — 📅 \${g('day')}/\${g('month')}/\${g('year')}هـ\`;
+    } catch (e) {
+        return d.toLocaleString('ar');
+    }
 }
 function openSectorNotesDelete(sector) {
     const box = document.getElementById('wf-box');
