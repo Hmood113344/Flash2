@@ -4931,6 +4931,7 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('promotions', this)">🎖️ طلبات الترقية/التنزيل</div>
             <div class="tab" onclick="adminTab('sector-leaders', this)">🎖️ قادة القطاعات</div>
+            <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
         </div>\` : \`
@@ -4962,6 +4963,7 @@ function adminTab(name, el) {
     if (name === 'promotions') loadAdminPromotionsPage();
     if (name === 'log') loadLog();
     if (name === 'sector-leaders') loadSectorLeaders();
+    if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
 }
 // تبويب طلبات الترقية/التنزيل بلوحة الإدارة — يعرضها لأي إداري (وليس فقط القيادة العليا)، ويسمح له بالبت فيها
