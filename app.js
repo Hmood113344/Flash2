@@ -2652,7 +2652,9 @@ app.post("/api/admin/personnel/:discord/rank-direct", ensureAnyAdmin, async (req
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
     const fromRank = p.rank;
     p.rank = CONFIG.MILITARY_RANKS[newIdx];
-    p.points = 0;
+    // ترقية: تاخذ تلقائياً نقاط عتبة الرتبة الجديدة (المضبوطة بصفحة "ترقيات النقاط") — تنزيل: تصفير النقاط
+    const settings = await getSettings();
+    p.points = direction === "up" ? await pointsForReachingRank(p.rank, settings) : 0;
     await p.save();
     const roleSync = await awaitRankSync(p, true);
     await logEvent({ action: direction === "up" ? "ترقية مباشرة (بحث الأفراد)" : "تنزيل مباشر (بحث الأفراد)", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${fromRank} ← ${p.rank}` });
