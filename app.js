@@ -1931,6 +1931,10 @@ client.on("ready", async () => {
 
 client.on("shardDisconnect", () => { botReady = false; });
 client.on("invalidated", () => { botReady = false; });
+// بعد أي قطع بسيط بالشبكة يرجع الاتصال يتصل (resume) من غير ما يعيد حدث "ready" الشامل —
+// بدون هذا كان botReady يفضل false للأبد بعد أول قطعة نت، حتى لو البوت شغال طبيعي فعلياً
+client.on("shardResume", () => { botReady = true; });
+client.on("shardReady", () => { botReady = true; });
 
 if (CONFIG.BOT_TOKEN) {
     startBot();
@@ -3309,16 +3313,15 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
 app.get("/api/bot/status", ensureBotController, (req, res) => {
     res.json({ online: botReady, starting: botStarting, hasToken: !!CONFIG.BOT_TOKEN });
 });
+// إعادة تشغيل فقط (مو إطفاء/تشغيل يدوي): لو البوت طافي يشغّله، لو شغال يسيبه شغال ويبلغ بذلك
 app.post("/api/bot/toggle", ensureBotController, async (req, res) => {
     if (botReady) {
-        const result = await stopBot();
-        await logEvent({ action: "إطفاء البوت يدوياً", actorId: req.user.id, actorTag: req.user.username });
-        return res.json({ ...result, online: botReady });
-    } else {
-        const result = await startBot();
-        await logEvent({ action: "تشغيل البوت يدوياً", actorId: req.user.id, actorTag: req.user.username });
-        return res.json({ ...result, online: botReady, starting: botStarting });
+        await logEvent({ action: "طلب إعادة تشغيل البوت", actorId: req.user.id, actorTag: req.user.username, details: "البوت شغال أصلاً — ما تغيّر شي" });
+        return res.json({ ok: true, alreadyOn: true, online: true });
     }
+    const result = await startBot();
+    await logEvent({ action: "تشغيل البوت يدوياً", actorId: req.user.id, actorTag: req.user.username, details: result.ok ? "تم التشغيل" : (result.error || "فشل التشغيل") });
+    return res.json({ ...result, online: botReady, starting: botStarting });
 });
 
 // ── إدارة كبار المسؤولين من الموقع مباشرة (بدون تعديل الكود) — لصاحب BOT_CONTROL_ID فقط ──
@@ -6963,6 +6966,8 @@ const LOG_META = {
     "إصدار إشعار":          { icon: "🔔", label: "إصدار إشعار",         color: "#fbbf24", border: "#78350f" },
     "تعاهد على تحذير":      { icon: "🤝", label: "تعاهد على تحذير",     color: "#4ade80", border: "#166534" },
     "تعاهد على إشعار":      { icon: "🤝", label: "تعاهد على إشعار",     color: "#4ade80", border: "#166534" },
+    "تشغيل البوت يدوياً":    { icon: "🤖", label: "تشغيل البوت",         color: "#4ade80", border: "#22c55e" },
+    "طلب إعادة تشغيل البوت": { icon: "🔄", label: "طلب إعادة تشغيل البوت", color: "#94a3b8", border: "#64748b" },
 };
 let lastLogId = null;
 let allLogsData = [];
@@ -7375,19 +7380,21 @@ async function loadBotControl() {
     const online = data.online;
     box.innerHTML = '<h3 style="margin-bottom:10px;">🤖 حالة البوت</h3>'
         + '<div class="row"><span>' + (online ? '🟢 البوت شغال' : (data.starting ? '🟡 جارِ التشغيل...' : '🔴 البوت مطفي')) + '</span></div>'
-        + '<button class="btn" id="bot-toggle-btn" style="margin-top:12px;background:' + (online ? '#ef4444' : '#22c55e') + ';" onclick="toggleBot()"' + (data.starting ? ' disabled' : '') + '>'
-        + (online ? 'إطفاء البوت' : 'تشغيل البوت') + '</button>';
+        + '<button class="btn" id="bot-toggle-btn" style="margin-top:12px;background:#3b82f6;" onclick="restartBot()"' + (data.starting ? ' disabled' : '') + '>'
+        + '🔄 إعادة تشغيل البوت</button>';
 }
-async function toggleBot() {
+async function restartBot() {
     const btn = document.getElementById('bot-toggle-btn');
     if (btn) btn.disabled = true;
     try {
         const r = await api('/api/bot/toggle', { method: 'POST' });
-        if (r && r.ok === false) toast(r.error || 'تعذر تنفيذ الأمر');
-        else toast('تم تنفيذ الأمر');
+        if (r && r.alreadyOn) toast('البوت مشغل من قبل');
+        else if (r && r.ok === false) toast(r.error || 'تعذر تشغيل البوت');
+        else toast('تم التشغيل');
     } catch (e) {
         toast(e.message);
     }
+    if (btn) btn.disabled = false; // يرجع الزر مكانه
     await loadBotControl();
     setTimeout(loadBotControl, 3000); // تحديث ثاني احتياطي لو ديسكورد تأخر بالاتصال
 }
