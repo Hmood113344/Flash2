@@ -2652,9 +2652,9 @@ app.post("/api/admin/personnel/:discord/rank-direct", ensureAnyAdmin, async (req
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
     const fromRank = p.rank;
     p.rank = CONFIG.MILITARY_RANKS[newIdx];
-    // ترقية: تاخذ تلقائياً نقاط عتبة الرتبة الجديدة (المضبوطة بصفحة "ترقيات النقاط") — تنزيل: تصفير النقاط
+    // ترقية أو تنزيل: ياخذ تلقائياً نقاط عتبة رتبته الجديدة (المضبوطة بصفحة "ترقيات النقاط")
     const settings = await getSettings();
-    p.points = direction === "up" ? await pointsForReachingRank(p.rank, settings) : 0;
+    p.points = await pointsForReachingRank(p.rank, settings);
     await p.save();
     const roleSync = await awaitRankSync(p, true);
     await logEvent({ action: direction === "up" ? "ترقية مباشرة (بحث الأفراد)" : "تنزيل مباشر (بحث الأفراد)", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${fromRank} ← ${p.rank}` });
@@ -3059,8 +3059,8 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
         const explicitPoints = points !== undefined && points !== "" && !isNaN(parseInt(points));
         if (!explicitPoints) {
             const newIdx = rankIndex(newRank);
-            if (newIdx > oldIdx) update.points = await pointsForReachingRank(newRank, settings);
-            else if (newIdx < oldIdx) update.points = 0; // تنزيل الرتبة يصفّر النقاط عشان ما يترقى تلقائي بنفس النقاط القديمة
+            // ترقية أو تنزيل: ياخذ نقاط عتبة رتبته الجديدة (سواء طالعة أو نازلة)
+            if (newIdx !== oldIdx) update.points = await pointsForReachingRank(newRank, settings);
         }
     }
     if (points !== undefined && points !== "" && !isNaN(parseInt(points))) update.points = Math.max(0, parseInt(points));
@@ -3620,7 +3620,7 @@ app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, 
     const settings = await getSettings();
     const oldRank = p.rank;
     p.rank = r.toRank;
-    p.points = r.direction === "up" ? await pointsForReachingRank(r.toRank, settings) : 0;
+    p.points = await pointsForReachingRank(r.toRank, settings); // ترقية أو تنزيل: نقاط عتبة الرتبة الجديدة
     await p.save();
     r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username + " (القيادة العليا)"; r.reviewedAt = new Date();
     await r.save();
