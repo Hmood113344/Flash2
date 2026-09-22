@@ -1935,6 +1935,12 @@ client.on("invalidated", () => { botReady = false; });
 // بدون هذا كان botReady يفضل false للأبد بعد أول قطعة نت، حتى لو البوت شغال طبيعي فعلياً
 client.on("shardResume", () => { botReady = true; });
 client.on("shardReady", () => { botReady = true; });
+// فحص دوري (كل 15 ثانية) يقارن حالة البوت المسجّلة عندنا بحالته الفعلية بديسكورد (client.isReady())
+// ويصححها لو صارت غير متطابقة — حماية إضافية حتى لو صار أي خلل تزامن ما شفناه
+setInterval(() => {
+    const actuallyReady = client.isReady();
+    if (actuallyReady !== botReady) botReady = actuallyReady;
+}, 15000);
 
 if (CONFIG.BOT_TOKEN) {
     startBot();
@@ -4504,6 +4510,7 @@ async function pollTick() {
         if (document.getElementById('notes-box')) renderNotes();
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
+        if (currentAdminTab === 'settings' && document.getElementById('bot-control-card')) loadBotControl();
         checkPendingWarning();
         checkPromotionAlert();
     } catch (e) {}
