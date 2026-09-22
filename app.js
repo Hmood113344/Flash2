@@ -6852,43 +6852,46 @@ function psPoints(discord, btn) {
     const form = document.createElement('div');
     form.id = 'pp-form-' + discord;
     form.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.12);';
+    // فورم مباشر: تكتب العدد، وتضغط إضافة أو خصم — تنفّذ فوراً من غير خطوة "اختر النوع" اللي كانت تلخبط
     form.innerHTML = ''
-        + '<div class="row" style="gap:6px;">'
-        + '<button type="button" class="btn sm" id="pp-inc-' + discord + '" onclick="ppSetType(\\'' + discord + '\\',\\'inc\\')">➕ زيادة</button>'
-        + '<button type="button" class="btn sm gray" id="pp-dec-' + discord + '" onclick="ppSetType(\\'' + discord + '\\',\\'dec\\')">➖ نقص</button>'
-        + '</div>'
-        + '<input id="pp-amount-' + discord + '" type="number" min="1" inputmode="numeric" placeholder="عدد النقاط" style="margin-top:8px;">'
+        + '<input id="pp-amount-' + discord + '" type="number" min="1" inputmode="numeric" placeholder="عدد النقاط" autofocus>'
         + '<input id="pp-reason-' + discord + '" placeholder="السبب (اختياري)" style="margin-top:8px;">'
         + '<div class="row" style="gap:6px;margin-top:8px;">'
-        + '<button type="button" class="btn sm" onclick="ppSubmit(\\'' + discord + '\\')">تأكيد</button>'
+        + '<button type="button" class="btn sm" id="pp-inc-' + discord + '" onclick="ppSubmit(\\'' + discord + '\\',\\'inc\\',this)">➕ إضافة</button>'
+        + '<button type="button" class="btn sm gray" id="pp-dec-' + discord + '" onclick="ppSubmit(\\'' + discord + '\\',\\'dec\\',this)">➖ خصم</button>'
         + '<button type="button" class="btn sm gray" onclick="ppCancel(\\'' + discord + '\\')">إلغاء</button>'
         + '</div>';
     card.appendChild(form);
-    form.dataset.ppType = 'inc';
-    ppSetType(discord, 'inc');
-}
-function ppSetType(discord, type) {
-    const form = document.getElementById('pp-form-' + discord);
-    if (form) form.dataset.ppType = type;
-    const incBtn = document.getElementById('pp-inc-' + discord);
-    const decBtn = document.getElementById('pp-dec-' + discord);
-    if (incBtn) incBtn.className = 'btn sm' + (type === 'inc' ? '' : ' gray');
-    if (decBtn) decBtn.className = 'btn sm' + (type === 'dec' ? '' : ' gray');
+    const amountEl = document.getElementById('pp-amount-' + discord);
+    if (amountEl) amountEl.focus();
 }
 function ppCancel(discord) {
     const form = document.getElementById('pp-form-' + discord);
     if (form) form.remove();
 }
-function ppSubmit(discord) {
-    const form = document.getElementById('pp-form-' + discord);
-    const type = (form && form.dataset.ppType) || 'inc';
+async function ppSubmit(discord, type, btn) {
     const amountEl = document.getElementById('pp-amount-' + discord);
-    const amount = parseInt(amountEl.value, 10);
-    if (!amount || amount <= 0) return toast('اكتب عدد نقاط صحيح');
+    const amount = parseInt(amountEl && amountEl.value, 10);
+    if (!amount || amount <= 0) { toast('اكتب عدد نقاط صحيح'); if (amountEl) amountEl.focus(); return; }
     const delta = type === 'inc' ? amount : -amount;
     const reason = (document.getElementById('pp-reason-' + discord).value || '').trim();
-    api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta, reason }) })
-        .then(() => { toast('تم'); refreshPersonnelViews(); }).catch(e => toast(e.message));
+    // نعطّل الزرين ونغيّر نص الزر المضغوط لحالة "جارِ..." عشان ما يبين إنه "معلّق" وهو فعلياً شغال
+    const incBtn = document.getElementById('pp-inc-' + discord);
+    const decBtn = document.getElementById('pp-dec-' + discord);
+    const original = btn ? btn.textContent : null;
+    if (incBtn) incBtn.disabled = true;
+    if (decBtn) decBtn.disabled = true;
+    if (btn) btn.textContent = 'جارِ التنفيذ...';
+    try {
+        await api('/api/admin/personnel/' + discord + '/points-direct', { method: 'POST', body: JSON.stringify({ delta, reason }) });
+        toast(type === 'inc' ? '✅ تمت إضافة ' + amount + ' نقطة' : '✅ تم خصم ' + amount + ' نقطة');
+        refreshPersonnelViews();
+    } catch (e) {
+        toast(e.message);
+        if (incBtn) incBtn.disabled = false;
+        if (decBtn) decBtn.disabled = false;
+        if (btn && original !== null) btn.textContent = original;
+    }
 }
 function psWarn(discord) {
     const reason = prompt('سبب التحذير:');
