@@ -3324,11 +3324,11 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
 });
 
 // ── تشغيل/إطفاء البوت يدوياً ──
-app.get("/api/bot/status", ensureBotController, (req, res) => {
+app.get("/api/bot/status", ensureSeniorAdmin, (req, res) => {
     res.json({ online: botReady, starting: botStarting, hasToken: !!CONFIG.BOT_TOKEN });
 });
 // إعادة تشغيل فقط (مو إطفاء/تشغيل يدوي): لو البوت طافي يشغّله، لو شغال يسيبه شغال ويبلغ بذلك
-app.post("/api/bot/toggle", ensureBotController, async (req, res) => {
+app.post("/api/bot/toggle", ensureSeniorAdmin, async (req, res) => {
     if (botReady) {
         await logEvent({ action: "طلب إعادة تشغيل البوت", actorId: req.user.id, actorTag: req.user.username, details: "البوت شغال أصلاً — ما تغيّر شي" });
         return res.json({ ok: true, alreadyOn: true, online: true });
@@ -4518,7 +4518,7 @@ async function pollTick() {
         if (document.getElementById('notes-box')) renderNotes();
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
-        if (currentAdminTab === 'settings' && document.getElementById('bot-control-card')) loadBotControl();
+        if (document.getElementById('bot-status-badge')) loadBotControl();
         checkPendingWarning();
         checkPromotionAlert();
     } catch (e) {}
@@ -4944,10 +4944,17 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
         </div>\`;
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card row" style="flex-wrap:wrap;gap:10px;">
+            <h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2>
+            <div class="row" style="width:auto;gap:10px;">
+                \${ME.isSeniorAdmin ? '<span id="bot-status-badge" style="font-size:13px;">جارِ تحميل حالة البوت...</span><button class="btn sm" id="bot-toggle-btn" onclick="restartBot()">🔄 إعادة تشغيل البوت</button>' : ''}
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
         \${tabsHtml}
         <div id="admin-content"></div>\`;
     adminTab('pending');
+    if (ME.isSeniorAdmin) loadBotControl();
 }
 function adminTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -7399,34 +7406,31 @@ async function loadSettings() {
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>
-        <div class="card" id="bot-control-card">جارِ تحميل حالة البوت...</div>
         <div class="card" id="senior-admins-card"></div>
         <div class="card" id="cmd-perm-card">جارِ تحميل صلاحيات أوامر البوت...</div>
         <div class="card" id="sector-role-card">جارِ تحميل آيديات رولات القطاعات...</div>
         <div class="card" id="rank-role-card">جارِ تحميل آيديات رتب العسكرية...</div>\`;
-    loadBotControl();
     loadSeniorAdmins();
     loadCommandPermissions();
     loadSectorRoleIds();
     loadRankRoleIds();
 }
-// ── تشغيل/إطفاء البوت يدوياً ──
+// ── تشغيل/إطفاء البوت يدوياً — بادج مختصر أعلى لوحة كبار المسؤولين، يشوفه كل كبير مسؤول ──
 async function loadBotControl() {
-    const box = document.getElementById('bot-control-card');
-    if (!box) return;
+    const badge = document.getElementById('bot-status-badge');
+    if (!badge) return;
     let data;
     try {
         data = await api('/api/bot/status');
     } catch (e) {
-        box.remove();
+        badge.textContent = '';
         return;
     }
-    if (currentAdminTab !== 'settings') return;
+    if (!document.getElementById('bot-status-badge')) return; // المستخدم غادر الصفحة
     const online = data.online;
-    box.innerHTML = '<h3 style="margin-bottom:10px;">🤖 حالة البوت</h3>'
-        + '<div class="row"><span>' + (online ? '🟢 البوت شغال' : (data.starting ? '🟡 جارِ التشغيل...' : '🔴 البوت مطفي')) + '</span></div>'
-        + '<button class="btn" id="bot-toggle-btn" style="margin-top:12px;background:#3b82f6;" onclick="restartBot()"' + (data.starting ? ' disabled' : '') + '>'
-        + '🔄 إعادة تشغيل البوت</button>';
+    badge.textContent = online ? '🟢 البوت شغال' : (data.starting ? '🟡 جارِ التشغيل...' : '🔴 البوت مطفي');
+    const btn = document.getElementById('bot-toggle-btn');
+    if (btn) btn.disabled = !!data.starting;
 }
 async function restartBot() {
     const btn = document.getElementById('bot-toggle-btn');
