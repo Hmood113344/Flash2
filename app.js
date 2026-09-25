@@ -4618,6 +4618,7 @@ async function loadOpsStats() {
             <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingViolations}</div><div class="lbl">مخالفات معلّقة</div></div>
             <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingLeaves}</div><div class="lbl">إجازات معلّقة</div></div>
             <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingPromotions}</div><div class="lbl">ترقيات/تنزيلات معلّقة</div></div>
+        \`;
     } catch (e) {
         box.innerHTML = \`<div style="color:#f87171;">تعذر تحميل الإحصائيات (\${e.message})</div>\`;
     }
