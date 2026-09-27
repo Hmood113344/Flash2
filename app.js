@@ -2047,6 +2047,14 @@ async function ensureBotController(req, res, next) {
     next();
 }
 
+async function ensureAntiDrugsRole(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (isSeniorAdmin(req.user.id)) return next();
+    const check = await isMilitary(req.user.id);
+    if (!check.isAntiDrugs) return res.status(403).json({ error: "تسجيل التقارير مخصص لمديرية مكافحة المخدرات فقط" });
+    next();
+}
+
 async function ensureAnyAdmin(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -2059,6 +2067,142 @@ async function ensureAnyAdmin(req, res, next) {
 
 // يسمح لقائد/نائب قطاع بالدخول لمساراته، وأيضاً لكبار المسؤولين (يتحكمون بكل شي)
 // لو كان كبير مسؤول لازم يحدد القطاع اللي يبيه عبر ?sector= بالكويري
+async function ensureSectorLeader(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    // لو الشخص فعلياً قائد/نائب قطاع حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
+    const realInfo = getSectorRole(req.user.id, settings);
+    if (realInfo) {
+        req.sectorInfo = realInfo;
+        req.settings = settings;
+        return next();
+    }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q], role: "senior" };
+        req.settings = settings;
+        return next();
+    }
+    return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
+}
+
+// قائد/نائب أي قطاع (الدوريات، أمن الطرق، مكافحة المخدرات) أو كبار المسؤولين يقدرون يقبلون/يرفضون مخالفات وتقارير قطاعهم
+function canReviewSector(sectorInfo) {
+    return true;
+}
+
+// يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
+async function ensurePersonnelOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    // لو الشخص فعلياً مسؤول أفراد حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
+    const realInfo = getPersonnelOfficerSector(req.user.id, settings);
+    if (realInfo) {
+        req.sectorInfo = realInfo;
+        return next();
+    }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
+        return next();
+    }
+    return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
+}
+
+// يسمح لـ"مسؤول التحضير" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
+async function ensureAttendanceOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const realInfo = getAttendanceOfficerSector(req.user.id, settings);
+    if (realInfo) { req.sectorInfo = realInfo; return next(); }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
+        return next();
+    }
+    return res.status(403).json({ error: "هذا القسم لمسؤول التحضير فقط" });
+}
+
+// يسمح بعرض حضور القطاع لأي من: مسؤول التحضير، قائد القطاع، نائب القطاع، أو كبار المسؤولين (عبر ?sector=)
+// هذي الصلاحية "عرض فقط" — تُستخدم بمعزل عن ensureSectorLeader/ensureAttendanceOfficer لأنها تجمع أكثر من دور بنفس الوقت
+async function ensureAttendanceViewer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const leaderInfo = getSectorRole(req.user.id, settings); // قائد أو نائب
+    if (leaderInfo) { req.sectorInfo = leaderInfo; return next(); }
+    const attInfo = getAttendanceOfficerSector(req.user.id, settings);
+    if (attInfo) { req.sectorInfo = attInfo; return next(); }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
+        return next();
+    }
+    return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات ومسؤول التحضير فقط" });
+}
+
+// يسمح لقائد/نائب الشرطة العسكرية (أو كبار المسؤولين) بدخول لوحة الشرطة العسكرية كاملة
+async function ensureMPLeader(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const role = getMPRole(req.user.id, settings);
+    if (role) { req.mpRole = role; req.settings = settings; return next(); }
+    if (isSeniorAdmin(req.user.id)) { req.mpRole = "senior"; req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم لقيادة الشرطة العسكرية فقط" });
+}
+// يسمح لمسؤول أفراد الشرطة العسكرية (أو كبار المسؤولين)
+async function ensureMPPersonnelOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isMPPersonnelOfficer(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم لمسؤول أفراد الشرطة العسكرية فقط" });
+}
+// يسمح لأي حامل رتبة الشرطة العسكرية (عادي أو قيادة) بدخول ميزات الملاحظة/الاستدعاء/تسجيل التقرير
+async function ensureMPMember(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isSeniorAdmin(req.user.id) || getMPRole(req.user.id, settings) || isMPPersonnelOfficer(req.user.id, settings)) {
+        req.settings = settings; return next();
+    }
+    const has = await isMilitaryPoliceMember(req.user.id);
+    if (!has) return res.status(403).json({ error: "هذا القسم لمنسوبي الشرطة العسكرية فقط" });
+    req.settings = settings;
+    next();
+}
+
+// يسمح لأعضاء القيادة العليا (أو كبار المسؤولين) بمراجعة طلبات الترقية/التنزيل
+async function ensureHighCommand(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isHighCommand(req.user.id, settings) || isSeniorAdmin(req.user.id) || (settings.adminList || []).includes(req.user.id)) { req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
+}
+
+// يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
+async function ensureJuniorInMySector(req, res, discordId) {
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return null; }
+    if (!ids.includes(discordId)) { res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" }); return null; }
+    const p = await Personnel.findOne({ discord: discordId });
+    if (!p) { res.status(404).json({ error: "غير موجود" }); return null; }
+    if (!isJuniorRank(p.rank)) { res.status(403).json({ error: "صلاحيتك تشمل رتبة رئيس رقباء وتحت فقط" }); return null; }
+    return p;
+}
+
+// إحصائيات سريعة تظهر فوراً بالصفحة الرئيسية لمركز العمليات — كل شي بانتظار مراجعة الإدارة
+app.get("/api/ops-stats", ensureAuth, async (req, res) => {
+    const [pendingViolations, pendingLeaves, pendingPromotions, checkedInNow] = await Promise.all([
+        Violation.countDocuments({ status: "pending" }),
+        LeaveRequest.countDocuments({ status: "pending" }),
+        PromotionRequest.countDocuments({ status: "pending" }),
+        AttendanceStatus.countDocuments({ status: "in" }),
+    ]);
+    res.json({ pendingViolations, pendingLeaves, pendingPromotions, checkedInNow });
+});
+
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
@@ -2179,6 +2323,97 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     });
 });
 
+app.post("/api/profile/setup", ensureAuth, async (req, res) => {
+    const { name, unit } = req.body;
+    if (!name || !unit) return res.status(400).json({ error: "أكمل الاسم واليونت" });
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.user.id }, { registeredName: name, unit }, { new: true, upsert: true }
+    );
+    res.json({ ok: true, registeredName: p.registeredName, unit: p.unit });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// نظام البصمة/التحضير — صار تسجيل الحضور والانصراف كامل عن طريق أمر البوت /لوحة-التسجيل فقط
+// (لا يوجد تسجيل حضور ذاتي بالموقع بعد الآن — الموقع صار للإدارة فقط)
+// ══════════════════════════════════════════════════════════════════════════
+
+app.get("/api/violations/meta", ensureAuth, async (req, res) => {
+    const vehicles = await Vehicle.find().sort({ name: 1 });
+    res.json({ types: CONFIG.VIOLATION_TYPES, vehicles: vehicles.map(v => ({ name: v.name, photo: v.photo })) });
+});
+
+const VIOLATION_COOLDOWN_MS = 5 * 1000;
+const violationLocks = new Set(); // يمنع إرسال مخالفتين بنفس اللحظة من نفس الحساب
+
+app.post("/api/violations/submit", ensureAuth, async (req, res) => {
+    if (violationLocks.has(req.user.id)) {
+        return res.status(429).json({ error: "في مخالفة قيد الإرسال حالياً على حسابك، انتظر لحظة." });
+    }
+    violationLocks.add(req.user.id);
+    try {
+        const settings = await getSettings();
+        if (settings.disableViolations) return res.status(403).json({ error: "تسجيل المخالفات مغلق حالياً" });
+        const p = await Personnel.findOne({ discord: req.user.id });
+        if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
+        if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
+        if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
+
+        // يمنع تسجيل مخالفة جديدة إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
+        const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
+        if (pendingCount >= CONFIG.MAX_PENDING_ITEMS) {
+            return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_ITEMS} مخالفات/تقارير معلّقة بانتظار المراجعة، لازم الإدارة تقبل أو ترفض وحدة منها قبل تسجيل مخالفة جديدة.` });
+        }
+
+        const last = await Violation.findOne({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
+        if (last) {
+            const elapsed = Date.now() - last.createdAt.getTime();
+            if (elapsed < VIOLATION_COOLDOWN_MS) {
+                const wait = Math.ceil((VIOLATION_COOLDOWN_MS - elapsed) / 1000);
+                return res.status(429).json({ error: `لازم تنتظر ${wait} ثانية قبل تسجيل مخالفة جديدة`, cooldown: wait });
+            }
+        }
+
+        const { violationType, vehicle, photo } = req.body;
+        if (!violationType || !vehicle) return res.status(400).json({ error: "أكمل نوع المخالفة والمركبة" });
+        if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المخالفة" });
+        if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
+            return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+        }
+        const vehicleDoc = await Vehicle.findOne({ name: vehicle });
+
+        const v = await Violation.create({
+            reporterDiscord: req.user.id, reporterTag: req.user.username,
+            reporterName: p.registeredName, reporterUnit: p.unit,
+            violationType, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
+            plateNumber: generatePlate(), status: "pending",
+        });
+        await postViolationToChannel(v, photo);
+        res.json({ ok: true, violation: v });
+    } finally {
+        violationLocks.delete(req.user.id);
+    }
+});
+
+app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
+    try {
+        // نشيل الصورة الثقيلة (base64) *قبل* الفرز — لو فرزنا والصورة لسا موجودة يتجاوز حد الذاكرة المسموح لفرز MongoDB ويطيح بخطأ
+        const list = await Violation.aggregate([
+            { $match: { reporterDiscord: req.user.id } },
+            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $project: { photo: 0 } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 500 }
+        ]);
+        res.json({ list });
+    } catch (e) {
+        console.error("❌ فشل تحميل مخالفاتي:", e);
+        res.status(500).json({ error: "تعذر تحميل مخالفاتك، حاول مرة ثانية" });
+    }
+});
+
+// جلب صورة مخالفة واحدة عند الطلب فقط (مو ضمن القائمة) — يسرّع تحميل القوائم
+const photoUrlCache = new Map(); // violationId -> { url, fetchedAt } — نتجنب نرجع نسأل ديسكورد كل ضغطة
+const PHOTO_CACHE_MS = 20 * 60 * 60 * 1000; // روابط مرفقات ديسكورد صالحة تقريباً 24 ساعة، نجدد قبل لا تنتهي
 function withTimeout(promise, ms) {
     return Promise.race([
         promise,
@@ -2272,6 +2507,21 @@ app.delete("/api/notes/:discord/:noteId", ensureAuth, async (req, res) => {
     res.json({ ok: true });
 });
 // تمديد مهلة مراجعة الملاحظة 5 أيام إضافية
+app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const note = p.notes.id(req.params.noteId);
+    if (!note) return res.status(404).json({ error: "الملاحظة غير موجودة" });
+    note.reviewDeadline = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+    note.reviewNotified = false;
+    await p.save();
+    await logEvent({ action: "تمديد مراجعة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "تمديد 5 أيام" });
+    res.json({ ok: true });
+});
+
+// ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
     // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = await Violation.aggregate([
@@ -2586,6 +2836,12 @@ app.get("/api/senior/personnel/:discord/warning-info", ensureSeniorAdmin, async 
 });
 
 // عقوبات التحذيرات (تُستخدم عند إصدار التحذير الثالث) — يستخدمها أي شخص عنده صلاحية إرسال تحذير
+app.get("/api/warn-penalties", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ list: settings.warningPenalties || [] });
+});
+
+// ── إدارة عقوبات التحذيرات (صفحة كبار المسؤولين — إضافة/تعديل/حذف) ──────
 app.get("/api/senior/penalties", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ list: settings.warningPenalties || [] });
@@ -2639,6 +2895,46 @@ app.delete("/api/senior/penalties/:id", ensureSeniorAdmin, async (req, res) => {
 
 // أقرب "مراجعة ملاحظة قديمة" لهذا المستخدم لسّه ما اتعاهد عليها — تستخدمها الواجهة للبولينج تعرضها بوجهه
 // (تحذير/إشعار الموقع اتشالت بالكامل بطلب من الإدارة — تصدر الآن فقط من بوت الأوامر بدون شاشة مقاطعة بالموقع)
+app.get("/api/warnings/pending", async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ warning: null });
+    const p = await Personnel.findOne({ discord: req.user.id }, { warnings: 1 });
+    if (!p || !p.warnings || !p.warnings.length) return res.json({ warning: null });
+    const pending = p.warnings.filter(w => !w.acknowledged && w.kind === "note-review").sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (!pending) return res.json({ warning: null });
+    res.json({ warning: {
+        id: pending._id, kind: pending.kind, reason: pending.reason, createdAt: pending.createdAt,
+        warningNumber: pending.warningNumber || null,
+        pointsDeducted: pending.pointsDeducted || 0,
+        penaltyLabel: pending.penaltyLabel || null,
+        noteReviewTargetDiscord: pending.noteReviewTargetDiscord || null,
+        noteReviewTargetName: pending.noteReviewTargetName || null,
+        noteReviewNoteId: pending.noteReviewNoteId || null,
+        noteReviewText: pending.noteReviewText || null,
+        noteReviewSectorLabel: pending.noteReviewSectorLabel || null,
+    } });
+});
+
+// اتعاهد وأقر بعدم تكرار ذلك
+app.post("/api/warnings/:id/ack", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const p = await Personnel.findOne({ discord: req.user.id });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const w = p.warnings.id(req.params.id);
+    if (!w) return res.status(404).json({ error: "غير موجود" });
+    if (!w.acknowledged) {
+        w.acknowledged = true;
+        w.acknowledgedAt = new Date();
+        await p.save();
+        await logEvent({
+            action: "تعاهد على " + (w.kind === "warning" ? "تحذير" : "إشعار"),
+            discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username,
+            details: w.reason,
+        });
+    }
+    res.json({ ok: true });
+});
+
+// يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
     const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, rank: 1, notes: 1 });
     // نجيب رتبة كل شخص أعطى ملاحظة (لو كان هو نفسه عسكري مسجّل بالنظام) عشان نعرضها بجنب اسمه
@@ -2779,6 +3075,49 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
 
 // ── تعديل نقاط الأعضاء — متاح لكبار المسؤولين، قادة/نواب القطاعات، ومسؤول الأفراد (بنطاق صلاحيته) ──
 // مسؤول الأفراد يقدر يعدّل نقاط رتبة "رئيس رقباء" وتحت فقط ضمن قطاعه، وقيادة القطاع تعدّل أي فرد بقطاعها
+async function ensurePointsEditor(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (isSeniorAdmin(req.user.id)) return next();
+    const settings = await getSettings();
+    const leaderInfo = getSectorRole(req.user.id, settings);
+    if (leaderInfo) {
+        const ids = await getSectorMemberIds(leaderInfo.sector);
+        if (ids === null) return res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً" });
+        if (!ids.includes(req.params.discord)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" });
+        return next();
+    }
+    const poInfo = getPersonnelOfficerSector(req.user.id, settings);
+    if (poInfo) {
+        const p = await ensureJuniorInMySector({ sectorInfo: poInfo }, res, req.params.discord);
+        if (!p) return; // ensureJuniorInMySector already sent the error response
+        return next();
+    }
+    return res.status(403).json({ error: "ليست لديك صلاحية تعديل النقاط" });
+}
+app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
+    const { points } = req.body;
+    if (points === undefined || points === "" || isNaN(parseInt(points))) return res.status(400).json({ error: "حط عدد نقاط صحيح" });
+    const before = await Personnel.findOne({ discord: req.params.discord });
+    if (!before) return res.status(404).json({ error: "غير موجود" });
+    const newValue = Math.max(0, parseInt(points));
+    const delta = newValue - before.points;
+    const pr = await applyOrQueuePoints({
+        discordId: req.params.discord, delta, actorId: req.user.id, actorTag: req.user.username,
+        source: "manual", reason: `تعديل نقاط يدوي — النقاط الجديدة المطلوبة: ${newValue}`,
+    });
+    if (pr.blocked) return res.status(403).json({ error: pr.error });
+    if (pr.applied) {
+        await logEvent({ action: "تعديل نقاط", discordId: before.discord, discordTag: before.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `النقاط الجديدة: ${pr.personnel.points}` });
+        await checkAutoPromotion(req.params.discord);
+        return res.json({ ok: true, personnel: pr.personnel });
+    }
+    await logEvent({ action: "طلب تعديل نقاط", discordId: before.discord, discordTag: before.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${delta >= 0 ? "+" : ""}${delta} نقطة — بانتظار موافقة الإدارة` });
+    res.json({ ok: true, queued: true, personnel: before, message: "تم إرسال طلب تعديل النقاط لموافقة الإدارة." });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// أرشيف المخالفات المقبولة/المرفوضة (كبار المسؤولين) + حذف نهائي
+// ══════════════════════════════════════════════════════════════════════════
 app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: { $in: ["approved", "rejected"] } } },
@@ -2801,6 +3140,82 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
 // ══════════════════════════════════════════════════════════════════════════
 // نظام الإجازات
 // ══════════════════════════════════════════════════════════════════════════
+app.get("/api/leave/mine", ensureAuth, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.user.id }, { leaveBalance: 1 });
+    const list = await LeaveRequest.find({ discord: req.user.id }).sort({ createdAt: -1 }).limit(50).lean();
+    res.json({ balance: p ? (p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE) : CONFIG.DEFAULT_LEAVE_BALANCE, list });
+});
+
+app.post("/api/leave/request", ensureAuth, async (req, res) => {
+    const { reason, days } = req.body;
+    const d = parseInt(days);
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب السبب" });
+    if (!d || d < 1) return res.status(400).json({ error: "حدد عدد أيام صحيح" });
+
+    const p = await Personnel.findOne({ discord: req.user.id });
+    if (!p || !p.registeredName) return res.status(400).json({ error: "أكمل بياناتك بالموقع أولاً" });
+    if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
+    const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE;
+    if (d > balance) return res.status(400).json({ error: `رصيدك الحالي ${balance} يوم فقط، ما يكفي لهذا الطلب` });
+
+    const pending = await LeaveRequest.countDocuments({ discord: req.user.id, status: "pending" });
+    if (pending >= 2) return res.status(400).json({ error: "عندك طلب إجازة قيد المراجعة بالفعل" });
+
+    const active = await LeaveRequest.findOne({ discord: req.user.id, status: "approved" });
+    if (active) return res.status(400).json({ error: "عندك إجازة نشطة حالياً، ما تقدر تطلب إجازة جديدة إلا بعد ما تنتهي" });
+
+    // بعد ما تنتهي إجازته (تلقائي أو يدوي)، ما يقدر يطلب إجازة جديدة إلا بعد 3 أيام من انتهائها
+    const lastCompleted = await LeaveRequest.findOne({ discord: req.user.id, status: "completed" }).sort({ endedAt: -1 });
+    if (lastCompleted && lastCompleted.endedAt) {
+        const cooldownMs = 3 * 24 * 60 * 60 * 1000;
+        const sinceEnd = Date.now() - new Date(lastCompleted.endedAt).getTime();
+        if (sinceEnd < cooldownMs) {
+            const daysLeft = Math.ceil((cooldownMs - sinceEnd) / (24 * 60 * 60 * 1000));
+            return res.status(400).json({ error: `لازم تنتظر ${daysLeft} يوم إضافي بعد انتهاء آخر إجازة قبل تقديم طلب جديد` });
+        }
+    }
+
+    const sectorKey = await getMemberSectorKey(req.user.id);
+    const leave = await LeaveRequest.create({
+        discord: req.user.id, discordTag: req.user.username,
+        name: p.registeredName, unit: p.unit, rank: p.rank,
+        sector: sectorKey, sectorLabel: sectorKey ? CONFIG.SECTORS[sectorKey] : null,
+        reason: reason.trim(), days: d,
+    });
+    await logEvent({ action: "طلب إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: p.discord, actorTag: p.discordTag, details: `${d} يوم — ${reason.trim()}` });
+    res.json({ ok: true, leave });
+});
+
+// طلبات الإجازة المعلّقة اللي يراجعها هذا الشخص:
+// - قائد/نائب القطاع: كل طلبات قطاعه
+// - مسؤول الأفراد: طلبات رتبة رئيس رقباء وتحت بقطاعه فقط (والقائد/النائب يشوفونها بعد الموافقة كـ"علم" فقط)
+app.get("/api/leave/pending", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    const leaderInfo = getSectorRole(req.user.id, settings);
+    const poInfo = getPersonnelOfficerSector(req.user.id, settings);
+    if (!leaderInfo && !poInfo && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ليست لديك صلاحية" });
+
+    let query = { status: { $in: ["pending", "approved"] } };
+    if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
+        // كبار المسؤولين بدون دور قطاعي حقيقي يحتاجون تحديد قطاع
+        const q = (req.query.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        query.sector = q;
+    } else if (leaderInfo) {
+        query.sector = leaderInfo.sector;
+    } else if (poInfo) {
+        query.sector = poInfo.sector;
+    }
+
+    let list = await LeaveRequest.find(query).sort({ createdAt: -1 }).limit(100).lean();
+    // مسؤول الأفراد يشوف بس طلبات رئيس رقباء وتحت
+    if (poInfo && !leaderInfo) {
+        list = list.filter(l => isJuniorRank(l.rank));
+    }
+    res.json({ list });
+});
+
+// كبار المسؤولين يشوفون كل طلبات الإجازات المعلّقة من كل القطاعات بصفحة وحدة
 app.get("/api/senior/leave/pending", ensureAnyAdmin, async (req, res) => {
     const list = await LeaveRequest.find({ status: { $in: ["pending", "approved"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
@@ -3177,14 +3592,24 @@ app.post("/api/senior/log/wipe", ensureSeniorAdmin, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 // 4.4.1) القيادة العليا — تراجع كل طلبات الترقية/التنزيل من كل القطاعات
 // ══════════════════════════════════════════════════════════════════════════
-async function ensureHighCommand(req, res, next) {
-    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
-    const settings = await getSettings();
-    if (isHighCommand(req.user.id, settings) || isSeniorAdmin(req.user.id) || (settings.adminList || []).includes(req.user.id)) { req.settings = settings; return next(); }
-    return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
-}
 app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, res) => {
     const list = await PromotionRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
+    res.json({ list });
+});
+// تنبيه فوري (شاشة كاملة زي نظام التحذيرات) لأي عضو بالقيادة العليا بأقدم طلب ترقية/تنزيل بانتظار المراجعة
+// يُستدعى بالبولينج — أول من يقبل/يرفض يسوي الطلب يختفي تلقائياً عند الجميع لأن حالته ما عادت "pending"
+app.get("/api/high-command/promotion-alert", ensureHighCommand, async (req, res) => {
+    const r = await PromotionRequest.findOne({ status: "pending" }).sort({ createdAt: 1 });
+    if (!r) return res.json({ alert: null });
+    res.json({ alert: {
+        id: r._id, sector: r.sector, sectorLabel: r.sectorLabel,
+        targetDiscord: r.targetDiscord, targetName: r.targetName, targetTag: r.targetTag,
+        fromRank: r.fromRank, toRank: r.toRank, direction: r.direction,
+        reason: r.reason, requestedByTag: r.requestedByTag, createdAt: r.createdAt,
+    } });
+});
+app.get("/api/high-command/promotion-requests/history", ensureHighCommand, async (req, res) => {
+    const list = await PromotionRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(200);
     res.json({ list });
 });
 app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, async (req, res) => {
@@ -3274,6 +3699,7 @@ app.post("/api/high-command/promotion-requests/:id/reject", ensureHighCommand, a
     res.json({ ok: true });
 });
 
+// إدارة أعضاء القيادة العليا — كبار المسؤولين فقط
 app.get("/api/senior/high-command", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ list: settings.highCommand || [] });
@@ -3475,6 +3901,41 @@ app.get("/", (req, res) => {
 </style>
 <div id="wf-overlay">
     <div class="wf-box" id="wf-box"></div>
+</div>
+<div id="warn-overlay">
+    <div class="warn-box">
+        <div class="warn-title"><span class="tri">⚠️</span><span id="warn-title-text">تحذير</span><span class="tri">⚠️</span></div>
+        <hr class="warn-line">
+        <div class="warn-extra" id="warn-extra-text"></div>
+        <div class="warn-reason" id="warn-reason-text"></div>
+    </div>
+    <button class="warn-ack-btn" id="warn-ack-btn" onclick="ackCurrentWarning()">🤝 اتعاهد وأقر بعدم تكرار ذلك</button>
+    <div class="row" id="warn-notereview-actions" style="display:none;gap:10px;margin-top:10px;">
+        <button class="btn danger sm" onclick="noteReviewDelete()">🗑️ حذف الملاحظة</button>
+        <button class="btn sm" onclick="noteReviewExtend()">⏳ تمديد 5 أيام</button>
+    </div>
+</div>
+<div id="promo-alert-overlay">
+    <div class="promo-box">
+        <div class="promo-title"><span>🎖️</span><span>ترقية عسكرية</span><span>🎖️</span></div>
+        <hr class="warn-line">
+        <div class="promo-extra" id="promo-alert-extra"></div>
+        <div class="promo-reason" id="promo-alert-reason"></div>
+    </div>
+    <div class="promo-actions">
+        <button class="promo-approve-btn" onclick="promoAlertApprove()">✅ قبول</button>
+        <button class="promo-reject-btn" onclick="promoAlertReject()">❌ رفض</button>
+    </div>
+</div>
+<div id="vtype-overlay">
+    <div class="vtype-box">
+        <h3>اختر نوع/أنواع المخالفة</h3>
+        <div class="vtype-grid" id="vtype-grid"></div>
+        <div class="vtype-actions">
+            <button class="btn gray" onclick="closeVTypeOverlay()">إلغاء</button>
+            <button class="btn" onclick="confirmVTypeSelection()">✅ تم</button>
+        </div>
+    </div>
 </div>
 </head>
 <body>
@@ -3716,26 +4177,256 @@ async function submitNoteForm() {
 }
 
 // ── فورم ملاحظة القطاعات — يسأل "هل لديك دليل؟" أولاً، والصورة تظهر بس لو "نعم" ──
+function openSectorNoteForm(discord, apiBase, reloadCall) {
+    noteFormCtx = { discord, apiBase, reloadCall };
+    noteImageData = null;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📝 إضافة ملاحظة</h3>
+        <p style="color:var(--muted);font-size:13px;margin-top:6px;">هل لديك دليل (صورة) على هذي الملاحظة؟</p>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="sectorNoteHasEvidence(true)">نعم</button>
+            <button class="wf-notice" onclick="sectorNoteHasEvidence(false)">لا</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function sectorNoteHasEvidence(hasEvidence) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📝 إضافة ملاحظة</h3>
+        <textarea id="nf-text" placeholder="اكتب سبب الملاحظة..."></textarea>
+        \${hasEvidence ? \`
+        <label style="margin-top:8px;display:block;font-size:13px;color:var(--muted);">صورة الملاحظة (إجبارية)</label>
+        <input type="file" id="nf-image" accept="image/*" onchange="previewNoteImage()">
+        <img id="nf-preview" style="display:none;max-width:100%;border-radius:8px;margin-top:8px;">\` : ''}
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSectorNoteForm(\${hasEvidence})">إرسال</button>
+        </div>\`;
+}
+async function submitSectorNoteForm(hasEvidence) {
+    const text = document.getElementById('nf-text').value;
+    if (!text || !text.trim()) return toast('اكتب الملاحظة');
+    if (hasEvidence && !noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
+    try {
+        await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: hasEvidence ? noteImageData : null }) });
+        toast('✅ تمت إضافة الملاحظة');
+        closeWarnForm();
+        noteImageData = null;
+        if (noteFormCtx.reloadCall) { try { Function(noteFormCtx.reloadCall)(); } catch (e) {} }
+    } catch (e) { toast(e.message); }
+}
+
+// ── فورم الاستدعاء (الآن / وقت محدد + صباح أو مساء) ──
+let summonFormCtx = null;
+function openSummonForm(discord, apiPath, reloadCall) {
+    summonFormCtx = { discord, apiPath, reloadCall };
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📣 استدعاء عسكري</h3>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="summonPickMode('now')">⏱️ الآن</button>
+            <button class="wf-notice" onclick="summonPickMode('scheduled')">🕒 وقت محدد</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function summonPickMode(mode) {
+    const box = document.getElementById('wf-box');
+    if (mode === 'now') {
+        box.innerHTML = \`
+            <h3>⏱️ استدعاء فوري</h3>
+            <p style="font-size:13px;color:var(--muted);margin-top:6px;">بيوصل للعضو إشعار "لديك استدعاء" فوراً.</p>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitSummonForm('now')">إرسال</button>
+            </div>\`;
+        return;
+    }
+    box.innerHTML = \`
+        <h3>🕒 حدد وقت الاستدعاء</h3>
+        <div class="row" style="gap:8px;">
+            <input type="number" id="sf-hour" placeholder="الساعة (1-12)" min="1" max="12" style="width:33%;">
+            <input type="number" id="sf-minute" placeholder="الدقيقة" min="0" max="59" style="width:33%;">
+            <select id="sf-ampm" style="width:33%;"><option value="صباح">صباح</option><option value="مساء">مساء</option></select>
+        </div>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSummonForm('scheduled')">إرسال</button>
+        </div>\`;
+}
+async function submitSummonForm(mode) {
+    const body = { mode };
+    if (mode === 'scheduled') {
+        body.hour = document.getElementById('sf-hour').value;
+        body.minute = document.getElementById('sf-minute').value;
+        body.ampm = document.getElementById('sf-ampm').value;
+        if (!body.hour || !body.minute) return toast('حدد الوقت كاملاً');
+    }
+    try {
+        const r = await api(summonFormCtx.apiPath + summonFormCtx.discord + '/summon', { method: 'POST', body: JSON.stringify(body) });
+        toast(r.pending ? '✅ تم إرسال طلب الاستدعاء لقيادة الشرطة العسكرية' : '✅ تم إرسال الاستدعاء');
+        closeWarnForm();
+        if (summonFormCtx.reloadCall) { try { Function(summonFormCtx.reloadCall)(); } catch (e) {} }
+    } catch (e) { toast(e.message); }
+}
+
+// ── إشعار للجميع (لكل الأعضاء المسجلين بالموقع) ─────────────────────────
+function openWarnAllForm() {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📢 ضع نص الإشعار (سيصل لكل الأعضاء المسجلين)</h3>
+        <textarea id="wf-reason-all" placeholder="اكتب نص الإشعار هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitWarnAllForm()">إرسال للجميع</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function submitWarnAllForm() {
+    const reason = document.getElementById('wf-reason-all').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب النص');
+    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل الأعضاء المسجلين بالموقع؟')) return;
+    try {
+        const { count } = await api('/api/senior/personnel/warn-all', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('✅ تم الإرسال لـ ' + count + ' عضو');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
+}
+
+// ── عرض التحذير/الإشعار بوجه المستقبِل (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
+let currentWarningId = null;
+async function checkPendingWarning() {
+    if (document.getElementById('warn-overlay').classList.contains('open')) return; // فيه وحدة معروضة أصلاً
+    try {
+        const { warning } = await api('/api/warnings/pending');
+        if (warning) showWarningOverlay(warning);
+    } catch (e) {}
+}
+function showWarningOverlay(w) {
+    currentWarningId = w.id;
+    currentNoteReview = w.kind === 'note-review' ? {
+        discord: w.noteReviewTargetDiscord, noteId: w.noteReviewNoteId,
+    } : null;
+    const overlay = document.getElementById('warn-overlay');
+    overlay.classList.remove('k-warning', 'k-notice');
+    overlay.classList.add(w.kind === 'warning' ? 'k-warning' : 'k-notice');
+    const numLabel = { 1: 'تحذير أول', 2: 'تحذير ثاني', 3: 'تحذير ثالث' };
+    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? (numLabel[w.warningNumber] || 'تحذير') : w.kind === 'note-review' ? '📋 مراجعة ملاحظة' : 'إشعار';
+    let extra = '';
+    if (w.kind === 'warning' && (w.warningNumber === 1 || w.warningNumber === 2) && w.pointsDeducted) extra = w.penaltyLabel || ('تم خصم ' + w.pointsDeducted + ' نقطة من رصيدك');
+    if (w.kind === 'warning' && w.warningNumber >= 3 && w.penaltyLabel) extra = 'العقوبة المطبقة: ' + w.penaltyLabel;
+    if (w.kind === 'note-review') extra = (w.noteReviewSectorLabel || '') + (w.noteReviewTargetName ? ' — ' + w.noteReviewTargetName : '');
+    document.getElementById('warn-extra-text').textContent = extra;
+    document.getElementById('warn-reason-text').textContent = w.kind === 'note-review' ? (w.noteReviewText || w.reason) : w.reason;
+    document.getElementById('warn-ack-btn').style.display = w.kind === 'note-review' ? 'none' : '';
+    document.getElementById('warn-ack-btn').textContent = w.kind === 'warning' ? '🤝 اتعاهد وأقر بعدم تكرار ذلك' : '✅ تم الاطلاع';
+    document.getElementById('warn-notereview-actions').style.display = w.kind === 'note-review' ? 'flex' : 'none';
+    overlay.classList.add('open');
+}
+let currentNoteReview = null;
+async function noteReviewDelete() {
+    if (!currentNoteReview || !currentWarningId) return;
+    if (!confirm('متأكد تبي تحذف هذي الملاحظة نهائياً؟')) return;
+    try {
+        await api('/api/notes/' + currentNoteReview.discord + '/' + currentNoteReview.noteId, { method: 'DELETE' });
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        toast('🗑️ تم حذف الملاحظة');
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null; currentNoteReview = null;
+        checkPendingWarning();
+    } catch (e) { toast(e.message); }
+}
+async function noteReviewExtend() {
+    if (!currentNoteReview || !currentWarningId) return;
+    try {
+        await api('/api/notes/' + currentNoteReview.discord + '/' + currentNoteReview.noteId + '/extend-review', { method: 'POST' });
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        toast('⏳ تم تمديد المراجعة 5 أيام');
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null; currentNoteReview = null;
+        checkPendingWarning();
+    } catch (e) { toast(e.message); }
+}
+async function ackCurrentWarning() {
+    if (!currentWarningId) return;
+    const btn = document.getElementById('warn-ack-btn');
+    btn.disabled = true;
+    try {
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null;
+        checkPendingWarning(); // لو فيه تحذير ثاني بالطابور
+    } catch (e) { toast(e.message); }
+    btn.disabled = false;
+}
+// ── تنبيه القيادة العليا بطلب ترقية/تنزيل جديد (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
+let currentPromoAlertId = null;
+async function checkPromotionAlert() {
+    if (!ME || !ME.isHighCommand) return;
+    if (document.getElementById('promo-alert-overlay').classList.contains('open')) return;
+    try {
+        const { alert } = await api('/api/high-command/promotion-alert');
+        if (alert) showPromotionAlert(alert);
+    } catch (e) {}
+}
+function showPromotionAlert(a) {
+    currentPromoAlertId = a.id;
+    const dirLabel = a.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل';
+    document.getElementById('promo-alert-extra').textContent =
+        dirLabel + ': ' + (a.targetName || a.targetTag) + '\\n' + a.fromRank + ' ← ' + a.toRank +
+        '\\nالقطاع: ' + a.sectorLabel + '\\nمقدّم الطلب: ' + (a.requestedByTag || '-');
+    document.getElementById('promo-alert-reason').textContent = 'السبب: ' + (a.reason || '-');
+    document.getElementById('promo-alert-overlay').classList.add('open');
+}
+function closePromotionAlert() {
+    document.getElementById('promo-alert-overlay').classList.remove('open');
+    currentPromoAlertId = null;
+    if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending();
+    checkPromotionAlert();
+}
+async function promoAlertApprove() {
+    if (!currentPromoAlertId) return;
+    if (!confirm('متأكد تبي تقبل هذا الطلب؟')) return;
+    try {
+        await api('/api/high-command/promotion-requests/' + currentPromoAlertId + '/approve', { method: 'POST' });
+        toast('✅ تمت الموافقة');
+        closePromotionAlert();
+    } catch (e) { toast(e.message); }
+}
+async function promoAlertReject() {
+    if (!currentPromoAlertId) return;
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب الرفض');
+    try {
+        await api('/api/high-command/promotion-requests/' + currentPromoAlertId + '/reject', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('❌ تم الرفض');
+        closePromotionAlert();
+    } catch (e) { toast(e.message); }
+}
+async function refreshMe() {
+    try { ME = await api('/api/me'); } catch (e) { /* تجاهل */ }
+}
 async function init() {
     try { ME = await api('/api/me'); } catch (e) { renderLogin(); return; }
     if (ME.blocked) { renderBlocked(ME.reason); return; }
-    // الموقع صار للإدارة فقط — باقي المهام تتم عبر البوت بديسكورد
-    if (!ME.isAdmin) { renderNotAdmin(); return; }
     lastKnownRank = ME.rank;
     buildNav();
-    renderAdmin();
+    if (checkSummonGate()) return;
+    renderDashboard();
+    checkPendingWarning();
+    checkPromotionAlert();
     startPolling();
-}
-function renderNotAdmin() {
-    document.getElementById('nav-links').innerHTML = '';
-    document.getElementById('mobile-menu').innerHTML = '';
-    document.getElementById('app').innerHTML = '<div class="card" style="text-align:center;padding:40px 20px;"><h2>هذا الموقع للإدارة فقط</h2><p style="color:var(--muted);margin-top:10px;">استخدم أوامر البوت بديسكورد.</p><button class="btn gray sm" style="margin-top:16px;" onclick="location.href=\'/auth/logout\'">تسجيل خروج</button></div>';
 }
 function buildNav() {
     const links = document.getElementById('nav-links');
     const mobile = document.getElementById('mobile-menu');
     if (!ME || ME.blocked) { links.innerHTML = ''; mobile.innerHTML = ''; return; }
-    const items = [];
+    const items = [
+        { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
+    ];
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
@@ -3748,6 +4439,58 @@ function renderFabs() {
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
 function closeMobileMenu() { document.getElementById('mobile-menu').classList.remove('open'); }
+function renderMinePage() {
+    document.getElementById('app').innerHTML = \`<div class="card"><h2>📋 مخالفاتي</h2><div id="mine-list">جارِ التحميل...</div></div>\`;
+    loadMine();
+}
+async function renderLeavePage() {
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🌴 الإجازات</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>
+        <div class="card" id="leave-balance-box">جارِ التحميل...</div>
+        <div class="card">
+            <h3>طلب إجازة جديدة</h3>
+            <label>عدد الأيام</label>
+            <input type="number" id="leave-days" min="1" placeholder="مثال: 2">
+            <label>السبب</label>
+            <textarea id="leave-reason" placeholder="اكتب سبب الإجازة..."></textarea>
+            <button class="btn" onclick="submitLeaveRequest()">إرسال الطلب</button>
+        </div>
+        <div class="card">
+            <h3>طلباتي السابقة</h3>
+            <div id="leave-mine-list">جارِ التحميل...</div>
+        </div>\`;
+    loadMyLeave();
+}
+async function loadMyLeave() {
+    try {
+        const { balance, list } = await api('/api/leave/mine');
+        document.getElementById('leave-balance-box').innerHTML = \`رصيدك الحالي: <b style="color:var(--gold-soft);font-size:18px;">\${balance}</b> يوم\`;
+        const box = document.getElementById('leave-mine-list');
+        box.innerHTML = list.length === 0 ? '<p style="color:var(--muted);">لا توجد طلبات سابقة</p>' :
+            list.map(l => \`
+                <div class="card" style="padding:10px 14px;margin-top:8px;">
+                    <div class="row">
+                        <div>
+                            <b>\${l.days} يوم</b>
+                            <div style="color:var(--muted);font-size:13px;">\${l.reason}</div>
+                        </div>
+                        <span class="badge \${l.status}">\${l.status === 'pending' ? 'قيد المراجعة' : l.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>
+                    </div>
+                    \${l.status === 'rejected' && l.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">سبب الرفض: \${l.rejectReason}</div>\` : ''}
+                </div>\`).join('');
+    } catch (e) { toast(e.message); }
+}
+async function submitLeaveRequest() {
+    const days = document.getElementById('leave-days').value;
+    const reason = document.getElementById('leave-reason').value;
+    if (!days || parseInt(days) < 1) return toast('حدد عدد أيام صحيح');
+    if (!reason || !reason.trim()) return toast('اكتب السبب');
+    try {
+        await api('/api/leave/request', { method: 'POST', body: JSON.stringify({ days: parseInt(days), reason }) });
+        toast('✅ تم إرسال طلب الإجازة');
+        renderLeavePage();
+    } catch (e) { toast(e.message); }
+}
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
@@ -3770,9 +4513,14 @@ async function pollTick() {
         lastKnownRank = fresh.rank;
         ME = fresh;
         buildNav();
+        if (document.getElementById('ops-stats-grid')) loadOpsStats();
+        if (document.getElementById('mine-list')) loadMine(true);
+        if (document.getElementById('notes-box')) renderNotes();
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
         if (document.getElementById('bot-status-badge')) loadBotControl();
+        checkPendingWarning();
+        checkPromotionAlert();
     } catch (e) {}
 }
 // لو صار عليه حظر/صيانة وهو شغّال، نفضل نتابعه بهدوء، وأول ما يرجع الوضع طبيعي نحدّث الصفحة تلقائياً
@@ -3821,6 +4569,355 @@ function renderBlocked(reason) {
             <a class="btn gray" href="/auth/logout" style="margin-top:16px;">تسجيل خروج</a>
         </div>\`;
 }
+function renderSetup() {
+    document.getElementById('app').innerHTML = \`
+        <div class="card" style="margin-top:40px;">
+            <h2>أكمل بياناتك العسكرية</h2>
+            <label>الاسم المسجل في السيرفر</label>
+            <input id="setup-name" placeholder="مثال: عبدالله الحربي">
+            <label>اليونت العسكري</label>
+            <input id="setup-unit" placeholder="مثال: الدورية الأولى">
+            <button class="btn" onclick="doSetup()">حفظ ومتابعة</button>
+        </div>\`;
+}
+async function doSetup() {
+    const name = document.getElementById('setup-name').value.trim();
+    const unit = document.getElementById('setup-unit').value.trim();
+    if (!name || !unit) return toast('أكمل الحقول');
+    try { await api('/api/profile/setup', { method: 'POST', body: JSON.stringify({ name, unit }) }); init(); }
+    catch (e) { toast(e.message); }
+}
+function renderDashboard() {
+    document.getElementById('app').innerHTML = \`
+        <div class="card row">
+            <div class="row" style="gap:14px;">
+                \${ME.avatar ? \`<img class="avatar" src="\${ME.avatar}">\` : ''}
+                <div><h2 style="margin-bottom:2px;">\${ME.registeredName || ME.discordTag}</h2><div style="color:var(--muted);font-size:13px;">\${ME.unit || '-'} • \${ME.rank}</div></div>
+            </div>
+            <div class="row" style="gap:8px;">
+                \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
+                <button class="btn gray sm" onclick="renderCard()">بطاقتي</button>
+                <a class="btn gray sm" href="/auth/logout">خروج</a>
+            </div>
+        </div>
+        \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
+        <div class="card">
+            <h3 style="margin-bottom:10px;">📊 إحصائيات مركز العمليات — بانتظار المراجعة</h3>
+            <div class="grid3" id="ops-stats-grid">جارِ التحميل...</div>
+        </div>
+        \${renderFabs()}
+    \`;
+    loadOpsStats();
+}
+async function loadOpsStats() {
+    const box = document.getElementById('ops-stats-grid');
+    if (!box) return;
+    try {
+        const s = await api('/api/ops-stats');
+        box.innerHTML = \`
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingViolations}</div><div class="lbl">مخالفات معلّقة</div></div>
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingLeaves}</div><div class="lbl">إجازات معلّقة</div></div>
+            <div class="stat"><div class="num" style="color:#fbbf24;">\${s.pendingPromotions}</div><div class="lbl">ترقيات/تنزيلات معلّقة</div></div>
+    } catch (e) {
+        box.innerHTML = \`<div style="color:#f87171;">تعذر تحميل الإحصائيات (\${e.message})</div>\`;
+    }
+}
+function renderNotes() {
+    const box = document.getElementById('notes-box');
+    if (!box) return;
+    if (!ME.notes || ME.notes.length === 0) { box.innerHTML = ''; return; }
+    box.innerHTML = '<div style="font-size:13px;color:var(--gold-soft);margin-bottom:6px;">ملاحظات عليك:</div>' +
+        ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${ME.discordId}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('');
+}
+async function loadMine(silent) {
+    const box = document.getElementById('mine-list');
+    try {
+        const { list } = await api('/api/violations/mine');
+        const cEl = document.getElementById('mine-count');
+        if (cEl) cEl.textContent = list.length;
+        if (!box) return;
+        if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
+        box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
+            list.map(v => \`<tr>
+                <td>\${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض</button>\` : '—'}</td>
+                <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
+                <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
+            </tr>\`).join('') + '</table>';
+    } catch (e) {
+        if (box) box.innerHTML = \`<p style="color:#f87171;">تعذر تحميل مخالفاتي، حاول تحدّث الصفحة. (\${e.message})</p>\`;
+    }
+}
+let vtypeSelected = [];
+async function renderNewViolation() {
+    const meta = await api('/api/violations/meta');
+    META = meta; selectedVehicle = null; photoBase64 = null; vtypeSelected = [];
+    document.getElementById('app').innerHTML = \`
+        <div class="card">
+            <h2>تسجيل مخالفة جديدة</h2>
+            <label>نوع المخالفة</label>
+            <div class="row" style="gap:10px;align-items:center;margin-bottom:12px;">
+                <button class="btn sm" type="button" onclick="openVTypeOverlay()">➕ اختيار نوع المخالفة</button>
+                <span id="vtype-summary" style="color:var(--muted);font-size:13px;">لم يتم اختيار أي نوع بعد</span>
+            </div>
+            <label>المركبة</label>
+            \${meta.vehicles.length ? \`<div class="vgrid" id="v-grid">\${meta.vehicles.map((v,i) => \`
+                <div class="vcard" id="vcard-\${i}" onclick="pickVehicle(\${i})">
+                    \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+                    <div>\${v.name}</div>
+                </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
+            <label>صورة المخالفة (إجباري)</label>
+            <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()" required>
+            <img id="v-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn" id="v-submit-btn" onclick="submitViolation()">إرسال</button>
+                <button class="btn gray" onclick="renderDashboard()">رجوع</button>
+            </div>
+        </div>\`;
+    if (meta.vehicles.length) pickVehicle(0);
+}
+// ── فورم اختيار نوع/أنواع المخالفة (بطاقات تتلوّن أخضر عند التحديد، تدعم اختيار أكثر من نوع) ──
+function openVTypeOverlay() {
+    const grid = document.getElementById('vtype-grid');
+    grid.innerHTML = META.types.map(function (t, i) {
+        const cls = vtypeSelected.indexOf(t) > -1 ? 'vtype-opt sel' : 'vtype-opt';
+        return '<div class="' + cls + '" id="vtype-opt-' + i + '" onclick="toggleVType(' + i + ')">' + t + '</div>';
+    }).join('');
+    document.getElementById('vtype-overlay').classList.add('open');
+}
+function toggleVType(i) {
+    const t = META.types[i];
+    const idx = vtypeSelected.indexOf(t);
+    const el = document.getElementById('vtype-opt-' + i);
+    if (idx > -1) { vtypeSelected.splice(idx, 1); el.classList.remove('sel'); }
+    else { vtypeSelected.push(t); el.classList.add('sel'); }
+}
+function closeVTypeOverlay() {
+    document.getElementById('vtype-overlay').classList.remove('open');
+}
+function confirmVTypeSelection() {
+    if (!vtypeSelected.length) { toast('اختر نوع مخالفة واحد على الأقل'); return; }
+    document.getElementById('vtype-summary').textContent = vtypeSelected.join('، ');
+    document.getElementById('vtype-summary').style.color = '#4ade80';
+    closeVTypeOverlay();
+}
+function pickVehicle(i) {
+    selectedVehicle = META.vehicles[i].name;
+    document.querySelectorAll('.vcard').forEach(el => el.classList.remove('sel'));
+    document.getElementById('vcard-' + i).classList.add('sel');
+}
+function previewPhoto() {
+    const f = document.getElementById('v-photo').files[0];
+    if (!f) return;
+    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+        photoBase64 = e.target.result;
+        const img = document.getElementById('v-photo-preview');
+        img.src = photoBase64; img.style.display = 'block';
+    };
+    reader.readAsDataURL(f);
+}
+let violationSubmitting = false;
+async function submitViolation() {
+    if (violationSubmitting) return; // يمنع الدبل-كليك من إرسال الطلب مرتين
+    if (!vtypeSelected.length) return toast('اختر نوع مخالفة واحد على الأقل');
+    const violationType = vtypeSelected.join('، ');
+    if (!selectedVehicle) return toast('اختر المركبة');
+    if (!photoBase64) return toast('لازم ترفق صورة المخالفة');
+    const btn = document.getElementById('v-submit-btn');
+    violationSubmitting = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'جارِ الإرسال...'; }
+    try {
+        await api('/api/violations/submit', { method: 'POST', body: JSON.stringify({ violationType, vehicle: selectedVehicle, photo: photoBase64 }) });
+        toast('تم الإرسال، بانتظار قبول الإدارة'); renderDashboard();
+    } catch (e) {
+        toast(e.message);
+        if (btn) { btn.disabled = false; btn.textContent = 'إرسال'; }
+    } finally {
+        violationSubmitting = false;
+    }
+}
+function renderNewReport() {
+    document.getElementById('app').innerHTML = \`
+        <div class="card">
+            <h2>تسجيل تقرير جديد</h2>
+            <p style="color:var(--muted);margin-bottom:14px;">اختر نوع التقرير:</p>
+            <div class="row" style="gap:8px;">
+                <button class="btn" onclick="renderReportForm('جنائي')">⚖️ جنائي</button>
+                <button class="btn" onclick="renderReportForm('مخدرات')">💊 مخدرات</button>
+            </div>
+            <div style="margin-top:14px;">
+                <button class="btn gray" onclick="renderDashboard()">رجوع</button>
+            </div>
+        </div>\`;
+}
+let reportItemCount = 0;
+async function renderReportForm(category) {
+    const meta = await api('/api/violations/meta');
+    reportMeta = meta; reportSelectedVehicle = null; reportVehiclePhoto = null;
+    reportItemCount = 0;
+    const isDrugs = category === 'مخدرات';
+    document.getElementById('app').innerHTML = \`
+        <div class="card">
+            <h2>تسجيل تقرير \${isDrugs ? 'مكافحة مخدرات' : 'جنائي'}</h2>
+            <label>اسم المتهم</label>
+            <input id="rp-suspect-name" placeholder="اسم المتهم">
+            <label>موقع الضبط</label>
+            <input id="rp-location" placeholder="موقع الضبط">
+            <label>المركبة</label>
+            \${meta.vehicles.length ? \`<div class="vgrid" id="rp-v-grid">\${meta.vehicles.map((v,i) => \`
+                <div class="vcard" id="rp-vcard-\${i}" onclick="pickReportVehicle(\${i})">
+                    \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+                    <div>\${v.name}</div>
+                </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
+            <h3 style="margin-top:16px;">تفاصيل العملية الميدانية</h3>
+            <label>سبب الاستيقاف</label>
+            <input id="rp-stop-reason" placeholder="سبب الاستيقاف">
+            <div class="row" style="margin-top:16px;"><h3>المخالفات على هذا المتهم (بحد أقصى 5)</h3><button type="button" class="btn sm gray" onclick="addReportItem('\${category}')">+ إضافة مخالفة</button></div>
+            <div id="rp-items-box"></div>
+            <label style="margin-top:12px;">الإجراءات الأمنية المتخذة</label>
+            <div id="rp-actions-box">
+                <div class="row rp-action-row" style="gap:6px;flex-wrap:nowrap;">
+                    <input class="rp-action" placeholder="- إجراء أمني" style="flex:1;">
+                    <button type="button" class="btn danger sm" style="flex:0 0 auto;" onclick="removeSecurityAction(this)">حذف</button>
+                </div>
+            </div>
+            <button class="btn gray sm" style="margin:8px 0;" onclick="addSecurityAction()">+ إضافة إجراء</button>
+            <label>صورة المركبة (إجباري)</label>
+            <input type="file" id="rp-photo" accept="image/*" onchange="previewReportPhoto()" required>
+            <img id="rp-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn" onclick="submitReport('\${category}')">إرسال التقرير</button>
+                <button class="btn gray" onclick="renderNewReport()">رجوع</button>
+            </div>
+        </div>\`;
+    if (meta.vehicles.length) pickReportVehicle(0);
+    addReportItem(category); // مخالفة أولى إجبارية
+}
+function addReportItem(category) {
+    const box = document.getElementById('rp-items-box');
+    if (box.querySelectorAll('.rp-item-block').length >= 5) return toast('الحد الأقصى 5 مخالفات بنفس التقرير');
+    reportItemCount++;
+    const i = reportItemCount;
+    const isDrugs = category === 'مخدرات';
+    const div = document.createElement('div');
+    div.className = 'card rp-item-block';
+    div.id = 'rp-item-' + i;
+    div.style.cssText = 'margin-top:8px;padding:12px;';
+    div.innerHTML = \`
+        <div class="row"><b>مخالفة #<span class="rp-item-num">\${box.children.length + 1}</span></b><button type="button" class="btn danger sm" onclick="removeReportItem(\${i})">حذف</button></div>
+        \${isDrugs ? \`
+        <label>نوع المخدر المضبوط</label>
+        <input class="rp-item-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
+        <label>الكمية المضبوطة</label>
+        <input class="rp-item-drug-qty" placeholder="مثال: 3 كيلو / 50 حبة">
+        <label>طريقة إخفاء المخدر</label>
+        <input class="rp-item-conceal" placeholder="مثال: مخبأ داخل صندوق السيارة">
+        \` : \`
+        <label>المضبوطات</label>
+        <textarea class="rp-item-seized" placeholder="المضبوطات" rows="2"></textarea>
+        \`}\`;
+    box.appendChild(div);
+    renumberReportItems();
+}
+function removeReportItem(i) {
+    const box = document.getElementById('rp-items-box');
+    if (box.querySelectorAll('.rp-item-block').length <= 1) return toast('لازم تبقى مخالفة واحدة على الأقل');
+    document.getElementById('rp-item-' + i).remove();
+    renumberReportItems();
+}
+function renumberReportItems() {
+    document.querySelectorAll('#rp-items-box .rp-item-block').forEach((el, idx) => {
+        el.querySelector('.rp-item-num').textContent = idx + 1;
+    });
+}
+function pickReportVehicle(i) {
+    reportSelectedVehicle = reportMeta.vehicles[i].name;
+    document.querySelectorAll('#rp-v-grid .vcard').forEach(el => el.classList.remove('sel'));
+    document.getElementById('rp-vcard-' + i).classList.add('sel');
+}
+function addSecurityAction() {
+    const box = document.getElementById('rp-actions-box');
+    const row = document.createElement('div');
+    row.className = 'row rp-action-row';
+    row.style.cssText = 'gap:6px;flex-wrap:nowrap;margin-top:6px;';
+    row.innerHTML = '<input class="rp-action" placeholder="- إجراء أمني" style="flex:1;"><button type="button" class="btn danger sm" style="flex:0 0 auto;" onclick="removeSecurityAction(this)">حذف</button>';
+    box.appendChild(row);
+}
+function removeSecurityAction(btn) {
+    const box = document.getElementById('rp-actions-box');
+    if (box.querySelectorAll('.rp-action-row').length <= 1) {
+        // لازم يبقى إجراء واحد على الأقل بالفورم
+        btn.closest('.rp-action-row').querySelector('.rp-action').value = '';
+        return;
+    }
+    btn.closest('.rp-action-row').remove();
+}
+function previewReportPhoto() {
+    const f = document.getElementById('rp-photo').files[0];
+    if (!f) return;
+    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+        reportVehiclePhoto = e.target.result;
+        const img = document.getElementById('rp-photo-preview');
+        img.src = reportVehiclePhoto; img.style.display = 'block';
+    };
+    reader.readAsDataURL(f);
+}
+async function submitReport(category) {
+    const isDrugs = category === 'مخدرات';
+    const suspectName = document.getElementById('rp-suspect-name').value.trim();
+    const arrestLocation = document.getElementById('rp-location').value.trim();
+    const stopReason = document.getElementById('rp-stop-reason').value.trim();
+    const securityActions = Array.from(document.querySelectorAll('.rp-action')).map(el => el.value.trim()).filter(Boolean);
+    if (!suspectName || !arrestLocation) return toast('أكمل اسم المتهم وموقع الضبط');
+    if (!reportSelectedVehicle) return toast('اختر المركبة');
+    if (!stopReason) return toast('أكمل تفاصيل العملية الميدانية');
+    if (!reportVehiclePhoto) return toast('لازم ترفق صورة المركبة');
+
+    const blocks = Array.from(document.querySelectorAll('#rp-items-box .rp-item-block'));
+    if (!blocks.length) return toast('أضف مخالفة واحدة على الأقل');
+    const items = [];
+    for (const b of blocks) {
+        if (isDrugs) {
+            const drugType = b.querySelector('.rp-item-drug-type').value.trim();
+            const drugQuantity = b.querySelector('.rp-item-drug-qty').value.trim();
+            const concealMethod = b.querySelector('.rp-item-conceal').value.trim();
+            if (!drugType || !drugQuantity || !concealMethod) return toast('أكمل كل حقول كل مخالفة (نوع المخدر، الكمية، طريقة الإخفاء)');
+            items.push({ drugType, drugQuantity, concealMethod });
+        } else {
+            const seizedItems = b.querySelector('.rp-item-seized').value.trim();
+            if (!seizedItems) return toast('اكتب المضبوطات لكل مخالفة');
+            items.push({ seizedItems });
+        }
+    }
+    try {
+        const r = await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
+            category, suspectName, arrestLocation, vehicle: reportSelectedVehicle,
+            stopReason, securityActions, photo: reportVehiclePhoto, items,
+        }) });
+        toast(\`✅ تم إرسال \${r.count} مخالفة على \${suspectName}، بانتظار المراجعة\`);
+        renderDashboard();
+    } catch (e) { toast(e.message); }
+}
+function renderCard() {
+    document.getElementById('app').innerHTML = \`
+        <div style="margin-top:30px;">
+            <div class="id-card">
+                \${ME.avatar ? \`<img class="avatar" src="\${ME.avatar}" style="display:block;margin:0 auto 12px;">\` : ''}
+                <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${ME.registeredName}</div>
+                <div class="center" style="font-size:13px;color:var(--muted);margin-bottom:14px;">${CONFIG.SITE_NAME} • بطاقة تعريف عسكرية</div>
+                <table>
+                    <tr><td>اليونت</td><td>\${ME.unit}</td></tr>
+                    <tr><td>الرتبة</td><td>\${ME.rank}</td></tr>
+                    <tr><td>النقاط</td><td>\${ME.points}</td></tr>
+                    <tr><td>الحالة</td><td>\${ME.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
+                </table>
+            </div>
+            <div class="center" style="margin-top:16px;"><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>
+        </div>\`;
+}
 function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
@@ -3850,7 +4947,7 @@ function renderAdmin() {
             <h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2>
             <div class="row" style="width:auto;gap:10px;">
                 \${ME.isSeniorAdmin ? '<span id="bot-status-badge" style="font-size:13px;">جارِ تحميل حالة البوت...</span><button class="btn sm" id="bot-toggle-btn" onclick="restartBot()">🔄 إعادة تشغيل البوت</button>' : ''}
-
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
         </div>
         \${tabsHtml}
@@ -3896,18 +4993,6 @@ async function loadAdminPromotionsPage() {
                 <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">❌ رفض</button>
             </div>
         </div>\`).join('');
-}
-function hcDecide(id, action) {
-    if (action === 'reject') {
-        const reason = prompt('اكتب سبب الرفض:');
-        if (reason === null) return;
-        if (!reason.trim()) return toast('لازم تكتب سبب');
-        api('/api/high-command/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
-            .then(() => { toast('تم الرفض'); loadAdminPromotionsPage(); }).catch(e => toast(e.message));
-        return;
-    }
-    api('/api/high-command/promotion-requests/' + id + '/approve', { method: 'POST' })
-        .then(() => { toast('✅ تمت الموافقة'); loadAdminPromotionsPage(); }).catch(e => toast(e.message));
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
@@ -3977,17 +5062,17 @@ function renderLeaveRequestsList(list, reload) {
     }).join('');
 }
 async function approveLeave(id, senior) {
-    try { await api('/api/leave/' + id + '/approve', { method: 'POST' }); toast('✅ تمت الموافقة'); loadSeniorLeavePage(); }
+    try { await api('/api/leave/' + id + '/approve', { method: 'POST' }); toast('✅ تمت الموافقة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 async function rejectLeave(id, senior) {
     const reason = prompt('سبب الرفض (اختياري):') || '';
-    try { await api('/api/leave/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) }); toast('تم الرفض'); loadSeniorLeavePage(); }
+    try { await api('/api/leave/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) }); toast('تم الرفض'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 async function endLeave(id, senior) {
     if (!confirm('متأكد تبي تنهي هذي الإجازة الآن؟')) return;
-    try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); loadSeniorLeavePage(); }
+    try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 
@@ -4076,6 +5161,1520 @@ function rejectV(id) {
 
 // ── قادة القطاعات (كبار المسؤولين) ───────────────────────────────────────
 let sectorsCache = { sectors: {}, leadership: {} };
+async function loadSectors() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/senior/sectors'); }
+    catch (e) {
+        if (currentAdminTab !== 'sectors') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (currentAdminTab !== 'sectors') return;
+    sectorsCache = data;
+    renderSectorsBox();
+}
+function renderSectorsBox() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    const keys = Object.keys(sectorsCache.sectors);
+    const mp = sectorsCache.mpLeadership || {};
+    box.innerHTML = keys.map(key => {
+        const label = sectorsCache.sectors[key];
+        const sec = (sectorsCache.leadership && sectorsCache.leadership[key]) || {};
+        return \`
+        <div class="card">
+            <h3>🪖 \${label}</h3>
+            <div class="row" style="margin-top:8px;">
+                <span>القائد: <b style="color:\${sec.commanderName ? '#4ade80' : 'var(--muted)'};">\${sec.commanderName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm" onclick="openSectorPicker('\${key}','commander')">قائد \${label}</button>
+                    \${sec.commanderName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','commander')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div class="row" style="margin-top:8px;">
+                <span>النائب: <b style="color:\${sec.deputyName ? '#4ade80' : 'var(--muted)'};">\${sec.deputyName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','deputy')">نائب \${label}</button>
+                    \${sec.deputyName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','deputy')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div class="row" style="margin-top:8px;">
+                <span>مسؤول الأفراد: <b style="color:\${sec.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${sec.personnelOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','personnelOfficer')">مسؤول أفراد \${label}</button>
+                    \${sec.personnelOfficerName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','personnelOfficer')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات، تحذيرات، ومخالفاتهم) — وطلبات الترقية/التنزيل اللي يسويها تروح لك أو للنائب بصفحة "ترقيات الأفراد" داخل لوحة قيادة القطاع للموافقة عليها.</div>
+            <div class="row" style="margin-top:8px;">
+                <span>مسؤول التحضير: <b style="color:\${sec.attendanceOfficerName ? '#4ade80' : 'var(--muted)'};">\${sec.attendanceOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','attendanceOfficer')">مسؤول تحضير \${label}</button>
+                    \${sec.attendanceOfficerName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','attendanceOfficer')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول التحضير يشوف حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
+            <div id="picker-\${key}-commander"></div>
+            <div id="picker-\${key}-deputy"></div>
+            <div id="picker-\${key}-personnelOfficer"></div>
+            <div id="picker-\${key}-attendanceOfficer"></div>
+        </div>\`;
+    }).join('') + \`
+        <div class="card">
+            <h3>🚔 الشرطة العسكرية</h3>
+            <div class="row" style="margin-top:8px;">
+                <span>القائد: <b style="color:\${mp.commanderName ? '#4ade80' : 'var(--muted)'};">\${mp.commanderName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm" onclick="openMPPicker('commander')">قائد الشرطة العسكرية</button>
+                    \${mp.commanderName ? '<button class="btn danger sm" onclick="removeMPRole(\\'commander\\')">إزالة</button>' : ''}
+                </div>
+            </div>
+            <div class="row" style="margin-top:8px;">
+                <span>النائب: <b style="color:\${mp.deputyName ? '#4ade80' : 'var(--muted)'};">\${mp.deputyName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openMPPicker('deputy')">نائب الشرطة العسكرية</button>
+                    \${mp.deputyName ? '<button class="btn danger sm" onclick="removeMPRole(\\'deputy\\')">إزالة</button>' : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول أفراد الشرطة العسكرية يعيّنه القائد أو النائب من داخل لوحة الشرطة العسكرية نفسها.</div>
+            <div id="picker-mp-commander"></div>
+            <div id="picker-mp-deputy"></div>
+        </div>
+        <div class="card">
+            <h3>⭐ القيادة العليا</h3>
+            <div style="color:var(--muted);font-size:12px;margin-bottom:8px;">تراجع كل طلبات الترقية والتنزيل من كل القطاعات — تقدر تضيف أكثر من شخص.</div>
+            <input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchHCCandidate(this.value)">
+            <div id="hc-cand-results"></div>
+            <div id="hc-members-list" style="margin-top:10px;">جارِ التحميل...</div>
+        </div>\`;
+    loadHighCommandList();
+}
+async function loadHighCommandList() {
+    const box = document.getElementById('hc-members-list');
+    if (!box) return;
+    try {
+        const { list } = await api('/api/senior/high-command');
+        if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا يوجد أعضاء بالقيادة العليا بعد</p>'; return; }
+        box.innerHTML = list.map(m => \`
+            <div class="card" style="padding:8px 12px;margin-top:6px;">
+                <div class="row">
+                    <span>\${m.name}</span>
+                    <button class="btn danger sm" onclick="removeHCMember('\${m.id}')">إزالة</button>
+                </div>
+            </div>\`).join('');
+    } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+}
+let hcSearchTimer = null;
+function searchHCCandidate(q) {
+    clearTimeout(hcSearchTimer);
+    hcSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('hc-cand-results');
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="addHCMember('\${p.discord}')">إضافة</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function addHCMember(discordId) {
+    try { await api('/api/senior/high-command/add', { method: 'POST', body: JSON.stringify({ discordId }) }); toast('تمت الإضافة'); document.getElementById('hc-cand-results').innerHTML = ''; loadHighCommandList(); }
+    catch (e) { toast(e.message); }
+}
+async function removeHCMember(discordId) {
+    if (!confirm('متأكد تبي تزيله من القيادة العليا؟')) return;
+    try { await api('/api/senior/high-command/remove', { method: 'POST', body: JSON.stringify({ discordId }) }); toast('تم'); loadHighCommandList(); }
+    catch (e) { toast(e.message); }
+}
+function openMPPicker(role) {
+    ['commander', 'deputy'].forEach(r => {
+        const el = document.getElementById('picker-mp-' + r);
+        if (el && r !== role) el.innerHTML = '';
+    });
+    const el = document.getElementById('picker-mp-' + role);
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = \`
+        <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+            <input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchMPCandidate('\${role}', this.value)">
+            <div id="cand-mp-\${role}"></div>
+        </div>\`;
+}
+let mpSearchTimer = null;
+function searchMPCandidate(role, q) {
+    clearTimeout(mpSearchTimer);
+    mpSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('cand-mp-' + role);
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignMPRole('\${role}','\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function assignMPRole(role, discordId) {
+    try { await api('/api/senior/mp/assign', { method: 'POST', body: JSON.stringify({ role, discordId }) }); toast('تم التعيين'); loadSectors(); }
+    catch (e) { toast(e.message); }
+}
+async function removeMPRole(role) {
+    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    try { await api('/api/senior/mp/remove', { method: 'POST', body: JSON.stringify({ role }) }); toast('تم'); loadSectors(); }
+    catch (e) { toast(e.message); }
+}
+function openSectorPicker(sectorKey, role) {
+    ['commander', 'deputy', 'personnelOfficer', 'attendanceOfficer'].forEach(r => {
+        Object.keys(sectorsCache.sectors).forEach(k => {
+            const el = document.getElementById('picker-' + k + '-' + r);
+            if (el && (k !== sectorKey || r !== role)) el.innerHTML = '';
+        });
+    });
+    const el = document.getElementById('picker-' + sectorKey + '-' + role);
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = \`
+        <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+            <input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchSectorCandidate('\${sectorKey}','\${role}', this.value)">
+            <div id="cand-\${sectorKey}-\${role}"></div>
+        </div>\`;
+}
+let sectorSearchTimer = null;
+function searchSectorCandidate(sectorKey, role, q) {
+    clearTimeout(sectorSearchTimer);
+    sectorSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('cand-' + sectorKey + '-' + role);
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignSectorRole('\${sectorKey}','\${role}','\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function assignSectorRole(sectorKey, role, discordId) {
+    try {
+        await api('/api/senior/sectors/' + sectorKey + '/assign', { method: 'POST', body: JSON.stringify({ role, discordId }) });
+        toast('تم التعيين');
+        loadSectors();
+    } catch (e) { toast(e.message); }
+}
+async function removeSectorRole(sectorKey, role) {
+    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    try {
+        await api('/api/senior/sectors/' + sectorKey + '/remove', { method: 'POST', body: JSON.stringify({ role }) });
+        toast('تم');
+        loadSectors();
+    } catch (e) { toast(e.message); }
+}
+
+// ── لوحة قيادة القطاع (لقادة/نواب القطاعات) ──────────────────────────────
+let sectorPanelTab = 'members';
+let sectorMembersCache = [];
+// ══════════════════════════════════════════════════════════════════════════
+// القيادة العليا — مراجعة طلبات الترقية/التنزيل من كل القطاعات
+// ══════════════════════════════════════════════════════════════════════════
+let hcTab = 'pending';
+function renderHighCommandPanel() {
+    if (!ME.isHighCommand) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>⭐ القيادة العليا</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="tabs">
+            <div class="tab active" onclick="hcTabSwitch('pending', this)">⏳ الطلبات المعلّقة</div>
+            <div class="tab" onclick="hcTabSwitch('history', this)">📜 السجل</div>
+        </div>
+        <div id="hc-content"></div>\`;
+    hcTabSwitch('pending');
+}
+function hcTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    hcTab = name;
+    if (name === 'pending') loadHCPending();
+    if (name === 'history') loadHCHistory();
+}
+function hcCard(r, withActions) {
+    return \`
+        <div class="card">
+            <b>\${r.targetName || r.targetTag}</b>
+            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">القطاع: \${r.sectorLabel} • مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
+            \${r.reason ? \`<div style="font-size:13px;margin-top:6px;">السبب: \${r.reason}</div>\` : ''}
+            \${!withActions ? \`<div style="margin-top:6px;"><span class="badge \${r.status}">\${r.status === 'approved' ? 'مقبول' : 'مرفوض'}</span>\${r.rejectReason ? ' — ' + r.rejectReason : ''}</div>\` : ''}
+            \${withActions ? \`
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="hcDecide('\${r._id}','approve')">قبول</button>
+                <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">رفض</button>
+            </div>\` : ''}
+        </div>\`;
+}
+async function loadHCPending() {
+    const box = document.getElementById('hc-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/high-command/promotion-requests'); }
+    catch (e) { if (hcTab !== 'pending') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (hcTab !== 'pending') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(r => hcCard(r, true)).join('');
+}
+function hcDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/high-command/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadHCPending(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/high-command/promotion-requests/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تمت الموافقة'); loadHCPending(); }).catch(e => toast(e.message));
+}
+async function loadHCHistory() {
+    const box = document.getElementById('hc-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/high-command/promotion-requests/history'); }
+    catch (e) { if (hcTab !== 'history') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (hcTab !== 'history') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => hcCard(r, false)).join('');
+}
+
+function renderSectorPanel() {
+    if (!ME.sectorInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🎖️ قيادة \${ME.sectorInfo.sectorLabel} (\${ME.sectorInfo.role === 'commander' ? 'قائد' : 'نائب'})</h2>
+            <div class="row" style="gap:8px;">
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
+        <div class="card">
+            <div class="row">
+                <span>مسؤول الأفراد: <b style="color:\${ME.sectorInfo.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${ME.sectorInfo.personnelOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openPersonnelOfficerPicker()">تعيين / تغيير</button>
+                    \${ME.sectorInfo.personnelOfficerName ? \`<button class="btn danger sm" onclick="removePersonnelOfficer()">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:6px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات وتحذيرات ومخالفاتهم). طلبات الترقية والتنزيل اللي يسويها ما تصير مباشرة — تجيك أو للنائب بتبويب "ترقيات الأفراد" تحت للموافقة عليها.</div>
+            <div id="po-picker"></div>
+        </div>
+        <div class="card">
+            <div class="row">
+                <span>مسؤول التحضير: <b style="color:\${ME.sectorInfo.attendanceOfficerName ? '#4ade80' : 'var(--muted)'};">\${ME.sectorInfo.attendanceOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openAttendanceOfficerPicker()">تعيين / تغيير</button>
+                    \${ME.sectorInfo.attendanceOfficerName ? \`<button class="btn danger sm" onclick="removeAttendanceOfficer()">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:6px;">مسؤول التحضير يشوف حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
+            <div id="ao-picker"></div>
+        </div>
+        <div class="tabs">
+            <div class="tab active" onclick="sectorTab('members', this)">أعضاء القطاع</div>
+            <div class="tab" onclick="sectorTab('violations', this)">مخالفات القطاع</div>
+            <div class="tab" onclick="sectorTab('file', this)">عرض ملف عسكري</div>
+            <div class="tab" onclick="sectorTab('promotions', this)">ترقيات الأفراد</div>
+            <div class="tab" onclick="sectorTab('attendance', this)">🖐️ حضور القطاع</div>
+            <div class="tab" onclick="sectorTab('leave', this)">🌴 طلبات الإجازات</div>
+        </div>
+        <div id="sector-content"></div>\`;
+    sectorTab('members');
+}
+// ── إشعار لكل أعضاء القطاع (حسب رول ديسكورد) — لقائد ونائب القطاع فقط ─────────
+function openSectorNoticeForm() {
+    if (!ME.sectorInfo) return;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📢 ضع نص الإشعار (سيصل لكل أعضاء \${ME.sectorInfo.sectorLabel} المسجلين بالموقع)</h3>
+        <textarea id="wf-reason-sector" placeholder="اكتب نص الإشعار هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSectorNoticeForm()">إرسال لأفراد القطاع</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function submitSectorNoticeForm() {
+    const reason = document.getElementById('wf-reason-sector').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب النص');
+    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل أعضاء ' + ME.sectorInfo.sectorLabel + '؟')) return;
+    try {
+        const { count } = await api('/api/sector/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('✅ تم الإرسال لـ ' + count + ' عضو');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
+}
+async function openAttendanceOfficerPicker() {
+    const el = document.getElementById('ao-picker');
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">جارِ التحميل...</div>';
+    try {
+        const { list } = await api('/api/sector/members');
+        if (list.length === 0) { el.innerHTML = '<p style="color:var(--muted);font-size:13px;margin-top:8px;">لا يوجد أعضاء بالقطاع حالياً</p>'; return; }
+        el.innerHTML = \`<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">\` +
+            list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignAttendanceOfficer('\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('') + \`</div>\`;
+    } catch (e) { el.innerHTML = '<p style="color:#f87171;font-size:13px;margin-top:8px;">' + e.message + '</p>'; }
+}
+async function assignAttendanceOfficer(discordId) {
+    try {
+        await api('/api/sector/attendance-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) });
+        toast('تم التعيين');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
+}
+async function removeAttendanceOfficer() {
+    if (!confirm('متأكد تبي تزيله من مسؤول التحضير؟')) return;
+    try {
+        await api('/api/sector/attendance-officer/remove', { method: 'POST' });
+        toast('تم');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
+}
+async function openPersonnelOfficerPicker() {
+    const el = document.getElementById('po-picker');
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">جارِ التحميل...</div>';
+    try {
+        const { list } = await api('/api/sector/members');
+        if (list.length === 0) { el.innerHTML = '<p style="color:var(--muted);font-size:13px;margin-top:8px;">لا يوجد أعضاء بالقطاع حالياً</p>'; return; }
+        el.innerHTML = \`<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">\` +
+            list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignPersonnelOfficer('\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('') + \`</div>\`;
+    } catch (e) { el.innerHTML = '<p style="color:#f87171;font-size:13px;margin-top:8px;">' + e.message + '</p>'; }
+}
+async function assignPersonnelOfficer(discordId) {
+    try {
+        await api('/api/sector/personnel-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) });
+        toast('تم التعيين');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
+}
+async function removePersonnelOfficer() {
+    if (!confirm('متأكد تبي تزيله من مسؤول الأفراد؟')) return;
+    try {
+        await api('/api/sector/personnel-officer/remove', { method: 'POST' });
+        toast('تم');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
+}
+function sectorTab(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    sectorPanelTab = name;
+    if (name === 'members') loadSectorMembers();
+    if (name === 'violations') loadSectorViolations();
+    if (name === 'file') renderSectorFileSearch();
+    if (name === 'promotions') loadPromotionRequests();
+    if (name === 'attendance') loadSectorAttendance();
+    if (name === 'leave') loadSectorLeavePending();
+}
+async function loadSectorAttendance() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/sector/attendance'); }
+    catch (e) {
+        if (sectorPanelTab !== 'attendance') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (sectorPanelTab !== 'attendance') return;
+    if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
+    box.innerHTML = data.list.map(m => \`
+        <div class="card row">
+            <div>
+                <b>\${m.name || 'غير مسجل بالموقع'}</b>
+                <div class="sub" style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
+                \${!m.registeredForAttendance ? '<div style="font-size:12px;color:#fca5a5;margin-top:2px;">لم يبصم من قبل</div>' :
+                    \`<div style="font-size:11px;color:var(--muted);margin-top:2px;">آخر حضور: \${m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'} • آخر انصراف: \${m.lastCheckOutAt ? new Date(m.lastCheckOutAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'}</div>\`}
+            </div>
+            <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? '✅ حاضر' : '⭕ منصرف'}</span>
+        </div>\`).join('');
+}
+// ── لوحة مستقلة لـ"مسؤول التحضير" (لمن ما يكون بنفس الوقت قائد/نائب قطاع) — نفس بيانات تبويب "حضور القطاع" ──
+function renderAttendanceOfficerPanel() {
+    if (!ME.attendanceOfficerInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🖐️ لوحة التحضير — \${ME.attendanceOfficerInfo.sectorLabel}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:6px;">حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
+        <div id="ao-panel-content"><div class="card">جارِ التحميل...</div></div>\`;
+    loadAttendanceOfficerPanel();
+}
+async function loadAttendanceOfficerPanel() {
+    const box = document.getElementById('ao-panel-content');
+    if (!box) return;
+    let data;
+    try { data = await api('/api/sector/attendance'); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
+    box.innerHTML = data.list.map(m => \`
+        <div class="card row">
+            <div>
+                <b>\${m.name || 'غير مسجل بالموقع'}</b>
+                <div class="sub" style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
+                \${!m.registeredForAttendance ? '<div style="font-size:12px;color:#fca5a5;margin-top:2px;">لم يبصم من قبل</div>' :
+                    \`<div style="font-size:11px;color:var(--muted);margin-top:2px;">آخر حضور: \${m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'} • آخر انصراف: \${m.lastCheckOutAt ? new Date(m.lastCheckOutAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'}</div>\`}
+            </div>
+            <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? '✅ حاضر' : '⭕ منصرف'}</span>
+        </div>\`).join('');
+}
+async function loadSectorLeavePending() {
+    const box = document.getElementById('sector-content') || document.getElementById('po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/leave/pending')); }
+    catch (e) {
+        if (sectorPanelTab !== 'leave' && poTab !== 'leave') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    box.innerHTML = renderLeaveRequestsList(list, false);
+}
+async function loadPromotionRequests() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/sector/promotion-requests'); }
+    catch (e) {
+        if (sectorPanelTab !== 'promotions') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (sectorPanelTab !== 'promotions') return;
+    const list = data.list || [];
+    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 طلبات الترقية والتنزيل (منك أو من مسؤول الأفراد) تراجعها القيادة العليا — هذي بس متابعة لحالتها.</div>\`;
+    if (list.length === 0) { box.innerHTML = note + '<div class="card center" style="color:var(--muted);">لا توجد طلبات حالياً</div>'; return; }
+    box.innerHTML = note + list.map(r => \`
+        <div class="card">
+            <b>\${r.targetName || r.targetTag}</b>
+            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            \${r.reason ? \`<div style="color:var(--muted);font-size:12px;margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
+            <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة (القيادة العليا)' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
+        </div>\`).join('');
+}
+async function loadSectorMembers() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/sector/members'); }
+    catch (e) {
+        if (sectorPanelTab !== 'members') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (sectorPanelTab !== 'members') return;
+    sectorMembersCache = data.list;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء مسجّلين بهذا القطاع حالياً</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="sectorPromote('\${p.discord}','up')">⬆️ ترقية</button>
+                    <button class="btn sm gray" onclick="sectorPromote('\${p.discord}','down')">⬇️ تنزيل</button>
+                    <button class="btn sm gray" onclick="sectorAssignUnit('\${p.discord}')">🪖 يونت</button>
+                    <button class="btn sm gray" onclick="editMemberPoints('\${p.discord}', \${p.points})">✏️ النقاط</button>
+                    <button class="btn sm gray" onclick="sectorAddNote('\${p.discord}')">📝 ملاحظة</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+async function sectorPromote(discord, direction) {
+    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب السبب');
+    try {
+        await api('/api/sector/personnel/' + discord + '/rank', { method: 'POST', body: JSON.stringify({ direction, reason }) });
+        toast('📩 تم إرسال الطلب للقيادة العليا للمراجعة');
+        loadSectorMembers();
+    } catch (e) { toast(e.message); }
+}
+function sectorAssignUnit(discord) {
+    const unit = prompt('اسم اليونت الجديد:');
+    if (unit === null) return;
+    if (!unit.trim()) return toast('حط اسم اليونت');
+    api('/api/sector/personnel/' + discord + '/unit', { method: 'POST', body: JSON.stringify({ unit }) })
+        .then(() => { toast('تم التعيين'); loadSectorMembers(); }).catch(e => toast(e.message));
+}
+function sectorAddNote(discord) {
+    openSectorNoteForm(discord, '/api/sector/personnel/', 'loadSectorMembers()');
+}
+async function loadSectorViolations() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/sector/violations'); }
+    catch (e) {
+        if (sectorPanelTab !== 'violations') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (sectorPanelTab !== 'violations') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير بعد</div>'; return; }
+    box.innerHTML = data.list.map(v => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    <div>
+                        <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
+                        <div style="margin-top:4px;"><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span></div>
+                    </div>
+                </div>
+                \${data.canReview && v.status === 'pending' ? \`
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="sectorApprove('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="sectorReject('\${v._id}')">رفض</button>
+                </div>\` : ''}
+            </div>
+        </div>\`).join('');
+}
+function sectorApprove(id) {
+    api('/api/sector/violations/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('تم القبول'); loadSectorViolations(); }).catch(e => toast(e.message));
+}
+function sectorReject(id) {
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    api('/api/sector/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم الرفض'); loadSectorViolations(); }).catch(e => toast(e.message));
+}
+function renderSectorFileSearch() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = \`
+        <div class="card">
+            <input id="sector-file-search" placeholder="🔍 ابحث عن اسم عضو من قطاعك..." oninput="filterSectorFileSearch()">
+            <div id="sector-file-results"></div>
+        </div>
+        <div id="sector-file-view"></div>\`;
+    if (sectorMembersCache.length === 0) {
+        api('/api/sector/members').then(d => { sectorMembersCache = d.list; }).catch(() => {});
+    }
+}
+function filterSectorFileSearch() {
+    const q = document.getElementById('sector-file-search').value.trim().toLowerCase();
+    const box = document.getElementById('sector-file-results');
+    if (!q) { box.innerHTML = ''; return; }
+    const matches = sectorMembersCache.filter(p => (p.registeredName || '').toLowerCase().includes(q) || (p.discordTag || '').toLowerCase().includes(q));
+    box.innerHTML = matches.map(p => \`
+        <div class="card" style="padding:8px 12px;margin-top:6px;">
+            <div class="row">
+                <span>\${p.registeredName || p.discordTag} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'})</span></span>
+                <button class="btn sm" onclick="viewSectorFile('\${p.discord}')">عرض الملف</button>
+            </div>
+        </div>\`).join('') || '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function viewSectorFile(discord) {
+    const box = document.getElementById('sector-file-view');
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        const { personnel: p } = await api('/api/sector/personnel/' + discord);
+        box.innerHTML = \`
+            <div class="id-card" style="margin-top:16px;">
+                <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
+                <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>
+                <table>
+                    <tr><td>اليونت</td><td>\${p.unit || '-'}</td></tr>
+                    <tr><td>الرتبة</td><td>\${p.rank}</td></tr>
+                </table>
+                \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
+                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${p.discord}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('') : ''}
+            </div>\`;
+    } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
+}
+
+// ── لوحة "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه ────
+let poTab = 'members';
+function renderPersonnelOfficerPanel() {
+    if (!ME.personnelOfficerInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>👥 مسؤول أفراد \${ME.personnelOfficerInfo.sectorLabel}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card" style="color:var(--muted);font-size:13px;">صلاحيتك تشمل أفراد قطاعك من رتبة <b style="color:var(--gold-soft);">رئيس رقباء وتحت</b> فقط. طلبات الترقية/التنزيل ما تصير فورية — تروح كطلب لقائد أو نائب القطاع للموافقة.</div>
+        <div class="tabs">
+            <div class="tab active" onclick="poTabSwitch('members', this)">الأفراد</div>
+            <div class="tab" onclick="poTabSwitch('violations', this)">مخالفات الأفراد</div>
+            <div class="tab" onclick="poTabSwitch('leave', this)">🌴 طلبات الإجازات</div>
+        </div>
+        <div id="po-content"></div>\`;
+    poTabSwitch('members');
+}
+function poTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    poTab = name;
+    if (name === 'members') loadPoMembers();
+    if (name === 'violations') loadPoViolations();
+    if (name === 'leave') loadSectorLeavePending();
+}
+async function loadPoMembers() {
+    const box = document.getElementById('po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/personnel-officer/members'); }
+    catch (e) {
+        if (poTab !== 'members') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (poTab !== 'members') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أفراد برتبة رئيس رقباء وتحت بقطاعك حالياً</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="poPromotionRequest('\${p.discord}','up')">⬆️ طلب ترقية</button>
+                    <button class="btn sm gray" onclick="poPromotionRequest('\${p.discord}','down')">⬇️ طلب تنزيل</button>
+                    <button class="btn sm gray" onclick="editMemberPoints('\${p.discord}', \${p.points})">✏️ النقاط</button>
+                    <button class="btn sm gray" onclick="poAddNote('\${p.discord}')">📝 ملاحظة</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+// تعديل نقاط عضو — متاح لقيادة القطاع ومسؤول الأفراد (بنطاق صلاحيته) بنفس أسلوب كبار المسؤولين
+async function editMemberPoints(discord, currentPoints) {
+    const val = prompt('عدد النقاط الجديد:', currentPoints);
+    if (val === null) return;
+    if (val === '' || isNaN(parseInt(val))) return toast('حط رقم صحيح');
+    try {
+        await api('/api/points/edit/' + discord, { method: 'POST', body: JSON.stringify({ points: parseInt(val) }) });
+        toast('تم تحديث النقاط');
+        if (sectorPanelTab === 'members') loadSectorMembers();
+        if (poTab === 'members') loadPoMembers();
+    } catch (e) { toast(e.message); }
+}
+function poPromotionRequest(discord, direction) {
+    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب السبب');
+    api('/api/personnel-officer/personnel/' + discord + '/promotion-request', { method: 'POST', body: JSON.stringify({ direction, reason }) })
+        .then(() => toast('📩 تم إرسال الطلب للقيادة العليا للمراجعة')).catch(e => toast(e.message));
+}
+function poAddNote(discord) {
+    openNoteForm(discord, '/api/personnel-officer/personnel/', 'loadPoMembers()');
+}
+async function loadPoViolations() {
+    const box = document.getElementById('po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/personnel-officer/violations'); }
+    catch (e) {
+        if (poTab !== 'violations') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (poTab !== 'violations') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير بعد</div>'; return; }
+    box.innerHTML = data.list.map(v => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    <div>
+                        <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
+                        <div style="margin-top:4px;"><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span></div>
+                    </div>
+                </div>
+                \${v.status === 'pending' ? \`
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="poApprove('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="poReject('\${v._id}')">رفض</button>
+                </div>\` : ''}
+            </div>
+        </div>\`).join('');
+}
+function poApprove(id) {
+    api('/api/personnel-officer/violations/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('تم القبول'); loadPoViolations(); }).catch(e => toast(e.message));
+}
+function poReject(id) {
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    api('/api/personnel-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم الرفض'); loadPoViolations(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// لوحة الشرطة العسكرية — قائد/نائب (3 صفحات: العساكر، التقارير، لوق القطاعات)
+// ══════════════════════════════════════════════════════════════════════════
+let mpTab = 'members';
+function renderMPPanel() {
+    if (!ME.mpInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? (' (' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : ''}</h2>
+            <div class="row" style="gap:8px;">
+                <button class="btn sm" onclick="openMPReportForm('renderMPPanel()')">+ تسجيل تقرير جديد</button>
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
+        <div class="tabs">
+            <div class="tab active" onclick="mpTabSwitch('members', this)">👤 العساكر</div>
+            <div class="tab" onclick="mpTabSwitch('force', this)">🚔 أفراد الشرطة العسكرية</div>
+            <div class="tab" onclick="mpTabSwitch('file', this)">📇 عرض ملف عسكري</div>
+            <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
+            <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
+            <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
+            <div class="tab" onclick="mpTabSwitch('promo', this)">🎖️ سجل الترقيات</div>
+            <div class="tab" onclick="mpTabSwitch('po', this)">👮 مسؤول الأفراد</div>
+        </div>
+        <div id="mp-content"></div>\`;
+    mpTabSwitch('members');
+}
+function openMPNoticeForm() {
+    if (!ME.mpInfo) return;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📢 ضع نص الإشعار (سيصل لكل أفراد الشرطة العسكرية المسجلين بالموقع)</h3>
+        <textarea id="wf-reason-mp" placeholder="اكتب نص الإشعار هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitMPNoticeForm()">إرسال لأفراد الشرطة العسكرية</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function submitMPNoticeForm() {
+    const reason = document.getElementById('wf-reason-mp').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب النص');
+    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل أفراد الشرطة العسكرية؟')) return;
+    try {
+        const { count } = await api('/api/mp/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('✅ تم الإرسال لـ ' + count + ' عضو');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
+}
+async function loadMPForceMembers() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/force-members'); }
+    catch (e) { if (mpTab !== 'force') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'force') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أفراد شرطة عسكرية مسجلين بعد</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPForceMembers()')">📝 ملاحظة</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function mpTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    mpTab = name;
+    if (name === 'members') loadMPMembers();
+    if (name === 'force') loadMPForceMembers();
+    if (name === 'file') renderMPFileSearch();
+    if (name === 'requests') loadMPSummonRequests();
+    if (name === 'reports') loadMPReports();
+    if (name === 'log') loadMPSectorLog();
+    if (name === 'promo') loadMPPromotionLog();
+    if (name === 'po') loadMPPOBox();
+}
+let mpLeaderListCache = [];
+async function loadMPMembers() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = \`<div class="card"><input id="mp-leader-search" placeholder="بحث بالاسم / اليونت / الرتبة" onkeyup="if(event.key==='Enter') filterMPLeaderMembers();"><button class="btn sm" onclick="filterMPLeaderMembers()">بحث</button></div><div id="mp-leader-results"><div class="card">جارِ التحميل...</div></div>\`;
+    let data;
+    try { data = await api('/api/mp/members'); }
+    catch (e) {
+        if (mpTab !== 'members') return;
+        document.getElementById('mp-leader-results').innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (mpTab !== 'members') return;
+    mpLeaderListCache = data.list;
+    renderMPLeaderMembersList(mpLeaderListCache);
+}
+function filterMPLeaderMembers() {
+    const input = document.getElementById('mp-leader-search');
+    const q = input ? input.value.trim() : '';
+    if (!q) return renderMPLeaderMembersList(mpLeaderListCache);
+    const filtered = mpLeaderListCache.filter(p =>
+        (p.registeredName || p.discordTag || '').includes(q) ||
+        (p.unit || '').includes(q) ||
+        (p.rank || '').includes(q)
+    );
+    renderMPLeaderMembersList(filtered);
+}
+function renderMPLeaderMembersList(list) {
+    const box = document.getElementById('mp-leader-results');
+    if (!box) return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
+    box.innerHTML = list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    \${p.summon && p.summon.status === 'approved' ? \`<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط — \${p.summon.timeLabel || ''}\${p.summon.enteredAt ? ' (دخل الاستدعاء)' : ''}</div>\` : ''}
+                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ طلب استدعاء بانتظار قبولك</div>' : ''}
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
+                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
+                    \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function mpStopSummon(discord) {
+    api('/api/mp/personnel/' + discord + '/summon/stop', { method: 'POST' })
+        .then(() => { toast('✅ تم إنهاء الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
+}
+function renderMPFileSearch() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = \`
+        <div class="card">
+            <input id="mp-file-search" placeholder="🔍 ابحث عن اسم العسكري..." oninput="filterMPFileSearch()">
+            <div id="mp-file-results"></div>
+        </div>
+        <div id="mp-file-view"></div>\`;
+    if (mpLeaderListCache.length === 0) {
+        api('/api/mp/members').then(d => { mpLeaderListCache = d.list; }).catch(() => {});
+    }
+}
+function filterMPFileSearch() {
+    const q = document.getElementById('mp-file-search').value.trim().toLowerCase();
+    const box = document.getElementById('mp-file-results');
+    if (!q) { box.innerHTML = ''; return; }
+    const matches = mpLeaderListCache.filter(p => (p.registeredName || '').toLowerCase().includes(q) || (p.discordTag || '').toLowerCase().includes(q));
+    box.innerHTML = matches.map(p => \`
+        <div class="card" style="padding:8px 12px;margin-top:6px;">
+            <div class="row">
+                <span>\${p.registeredName || p.discordTag} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'})</span></span>
+                <button class="btn sm" onclick="viewMPFile('\${p.discord}')">عرض الملف</button>
+            </div>
+        </div>\`).join('') || '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function viewMPFile(discord) {
+    const box = document.getElementById('mp-file-view');
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        const { personnel: p, progress } = await api('/api/mp/personnel/' + discord);
+        box.innerHTML = \`
+            <div class="id-card" style="margin-top:16px;">
+                <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
+                <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري كامل</div>
+                <table>
+                    <tr><td>اليونت</td><td>\${p.unit || '-'}</td></tr>
+                    <tr><td>الرتبة</td><td>\${p.rank}</td></tr>
+                    <tr><td>النقاط</td><td>\${p.points}</td></tr>
+                    <tr><td>متبقي للترقية</td><td>\${progress.nextRank ? (progress.remaining + ' نقطة (' + progress.nextRank + ')') : 'وصل لأعلى رتبة'}</td></tr>
+                    <tr><td>الحالة</td><td>\${p.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
+                    \${p.summon && p.summon.status !== 'none' ? \`<tr><td>الاستدعاء</td><td>\${p.summon.status === 'approved' ? '📣 نشط — ' + (p.summon.timeLabel || '') : '⏳ طلب معلّق'}</td></tr>\` : ''}
+                </table>
+                \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
+                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${p.discord}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('') : ''}
+            </div>\`;
+    } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
+}
+async function loadMPSummonRequests() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/summon-requests'); }
+    catch (e) { if (mpTab !== 'requests') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'requests') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات استدعاء معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.rank}</span>
+                    <div style="color:var(--gold-soft);margin-top:4px;">🕒 \${p.summon.timeLabel}</div>
+                </div>
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="mpSummonReqDecide('\${p.discord}','approve')">قبول</button>
+                    <button class="btn danger sm" onclick="mpSummonReqDecide('\${p.discord}','reject')">رفض</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function mpSummonReqDecide(discord, action) {
+    api('/api/mp/summon-requests/' + discord + '/' + action, { method: 'POST' })
+        .then(() => { toast(action === 'approve' ? '✅ تم قبول الاستدعاء' : 'تم رفض الطلب'); loadMPSummonRequests(); })
+        .catch(e => toast(e.message));
+}
+function renderMPReportCard(r, decideFn, isLeaderView) {
+    const statusBadge = r.status === 'approved' ? '<span style="color:#4ade80;font-size:12px;">✅ مقبول</span>'
+        : r.status === 'rejected' ? '<span style="color:#f87171;font-size:12px;">❌ مرفوض</span>'
+        : '<span style="color:#fbbf24;font-size:12px;">⏳ معلّق</span>';
+    let actions = '';
+    if (r.status === 'pending') {
+        actions = \`
+            <button class="btn sm" onclick="\${decideFn}('\${r._id}','approve')">قبول التقرير</button>
+            <button class="btn danger sm" onclick="\${decideFn}('\${r._id}','reject')">رفض</button>\`;
+    } else if (isLeaderView && r.status === 'approved') {
+        actions = \`<button class="btn danger sm" onclick="mpDeleteReport('\${r._id}')">🗑️ حذف نهائي</button>\`;
+    } else if (isLeaderView && r.status === 'rejected') {
+        actions = \`
+            <button class="btn sm" onclick="\${decideFn}('\${r._id}','approve')">قبول مباشر</button>
+            <button class="btn danger sm" onclick="mpDeleteReport('\${r._id}')">🗑️ حذف نهائي</button>\`;
+        if (r.rejectReason) actions = \`<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">سبب الرفض: \${r.rejectReason}</div>\` + actions;
+    }
+    return \`
+        <div class="card">
+            <div class="row"><b>\${r.reporterName}</b> \${statusBadge}</div>
+            <span style="color:var(--muted);font-size:12px;">(\${r.reporterRank})</span>
+            <div style="margin-top:6px;color:var(--gold-soft);">1) وش سوى بالاستلام:</div>
+            <div style="font-size:13px;margin-top:2px;">\${r.dutyReport}</div>
+            <div style="margin-top:8px;color:var(--gold-soft);">2) عدد الجولات/الدوريات: <span style="color:#fff;">\${r.patrolsCount || 0}</span></div>
+            <div style="margin-top:4px;color:var(--gold-soft);">3) عدد الاستدعاءات المنفّذة: <span style="color:#fff;">\${r.summonsCount || 0}</span></div>
+            \${r.incidents ? \`<div style="margin-top:8px;color:var(--gold-soft);">4) مخالفات/حالات مشبوهة:</div><div style="font-size:13px;margin-top:2px;">\${r.incidents}</div>\` : ''}
+            \${r.notesIssued && r.notesIssued.length ? \`<div style="margin-top:8px;color:var(--gold-soft);">5) الملاحظات/التحذيرات المسجّلة (\${r.notesIssued.length}):</div>\` + r.notesIssued.map(n => \`<div style="font-size:12px;color:var(--muted);margin-top:3px;">• \${n.name || n.tag} (\${n.kind === 'warning' ? 'تحذير' : 'ملاحظة'}) — \${n.reason}</div>\`).join('') : ''}
+            \${r.generalNotes ? \`<div style="margin-top:8px;color:var(--gold-soft);">6) ملاحظات عامة:</div><div style="font-size:13px;margin-top:2px;">\${r.generalNotes}</div>\` : ''}
+            <div class="row" style="gap:8px;margin-top:10px;">\${actions}</div>
+        </div>\`;
+}
+async function loadMPReports() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/reports/all'); }
+    catch (e) { if (mpTab !== 'reports') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'reports') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpReportDecide', true)).join('');
+}
+function mpDeleteReport(id) {
+    if (!confirm('متأكد تبي تحذف هذا التقرير نهائياً؟ ما يرجع بعدها.')) return;
+    api('/api/mp/reports/' + id, { method: 'DELETE' })
+        .then(() => { toast('🗑️ تم الحذف نهائياً'); loadMPReports(); }).catch(e => toast(e.message));
+}
+function mpReportDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/mp/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadMPReports(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/mp/reports/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تم قبول التقرير'); loadMPReports(); }).catch(e => toast(e.message));
+}
+async function loadMPSectorLog() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/sector-log'); }
+    catch (e) { if (mpTab !== 'log') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'log') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد أحداث بعد</div>'; return; }
+    box.innerHTML = data.list.map(l => \`
+        <div class="card" style="padding:10px 14px;">
+            <div style="font-size:13px;"><b>\${l.action}</b> — \${l.actorTag || '-'}</div>
+            \${l.discordTag ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">على: \${l.discordTag}</div>\` : ''}
+            \${l.details ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">\${l.details}</div>\` : ''}
+            <div style="font-size:11px;color:var(--muted);margin-top:4px;">\${new Date(l.createdAt).toLocaleString('ar')}</div>
+        </div>\`).join('');
+}
+// سجل كامل ودائم لكل طلبات الترقية/التنزيل — لعلم قيادة الشرطة العسكرية: مين قدّم ومتى، ومين وافق/رفض ومتى
+async function loadMPPromotionLog() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/promotion-log'); }
+    catch (e) { if (mpTab !== 'promo') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'promo') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات ترقية/تنزيل بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => {
+        const statusLabel = r.status === 'pending' ? '⏳ قيد المراجعة' : r.status === 'approved' ? '✅ مقبولة' : '❌ مرفوضة';
+        const statusColor = r.status === 'pending' ? '#fbbf24' : r.status === 'approved' ? '#4ade80' : '#f87171';
+        return \`
+        <div class="card" style="padding:10px 14px;">
+            <div style="font-size:13px;"><b>\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.targetName || r.targetTag}</b> — \${r.fromRank} ← \${r.toRank}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">القطاع: \${r.sectorLabel} — قدّمه: \${r.requestedByTag || '-'}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">وقت التقديم: \${new Date(r.createdAt).toLocaleString('ar')}</div>
+            \${r.reason ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
+            <div style="font-size:12px;margin-top:4px;color:\${statusColor};font-weight:bold;">\${statusLabel}</div>
+            \${r.status !== 'pending' ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">راجعه: \${r.reviewedByTag || '-'} — \${r.reviewedAt ? new Date(r.reviewedAt).toLocaleString('ar') : '-'}</div>\` : ''}
+            \${r.status === 'rejected' && r.rejectReason ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">سبب الرفض: \${r.rejectReason}</div>\` : ''}
+        </div>\`;
+    }).join('');
+}
+// صندوق تعيين/إزالة مسؤول أفراد الشرطة العسكرية داخل لوحة القيادة نفسها
+async function loadMPPOBox() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = \`<div class="card"><h3>👮 مسؤول أفراد الشرطة العسكرية</h3><div id="mp-po-current">جارِ التحميل...</div><input id="mp-po-search" placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchMPPOCandidate(this.value)"><div id="mp-po-cands"></div></div>\`;
+    try {
+        const { mpLeadership } = await api('/api/senior/mp/leadership').catch(() => ({ mpLeadership: null }));
+        const cur = mpLeadership || {};
+        document.getElementById('mp-po-current').innerHTML = \`الحالي: <b style="color:\${cur.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${cur.personnelOfficerName || 'غير معيّن'}</b> \${cur.personnelOfficerName ? '<button class="btn danger sm" onclick="mpRemovePO()">إزالة</button>' : ''}\`;
+    } catch (e) { document.getElementById('mp-po-current').innerHTML = '—'; }
+}
+let mpPoSearchTimer = null;
+function searchMPPOCandidate(q) {
+    clearTimeout(mpPoSearchTimer);
+    mpPoSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('mp-po-cands');
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/mp/members');
+            const filtered = list.filter(p => p.registeredName && p.registeredName.includes(q));
+            if (filtered.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = filtered.slice(0, 15).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="mpAssignPO('\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+function mpAssignPO(discordId) {
+    api('/api/mp/personnel-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) })
+        .then(() => { toast('تم التعيين'); loadMPPOBox(); }).catch(e => toast(e.message));
+}
+function mpRemovePO() {
+    if (!confirm('متأكد تبي تزيله من منصب مسؤول الأفراد؟')) return;
+    api('/api/mp/personnel-officer/remove', { method: 'POST' })
+        .then(() => { toast('تم'); loadMPPOBox(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// لوحة مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية (ما عدا القائد والنائب)
+// ══════════════════════════════════════════════════════════════════════════
+let mpPoTab = 'members';
+function renderMPPOPanel() {
+    if (!ME.mpPersonnelOfficer && !ME.isSeniorAdmin) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>👮 مسؤول أفراد الشرطة العسكرية</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card" style="color:var(--muted);font-size:13px;">صلاحيتك تشمل أعضاء الشرطة العسكرية ما عدا القائد والنائب.</div>
+        <div class="tabs">
+            <div class="tab active" onclick="mpPoTabSwitch('members', this)">الأعضاء</div>
+            <div class="tab" onclick="mpPoTabSwitch('reports', this)">التقارير</div>
+        </div>
+        <div id="mp-po-content"></div>\`;
+    mpPoTabSwitch('members');
+}
+function mpPoTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    mpPoTab = name;
+    if (name === 'members') loadMPPOMembers();
+    if (name === 'reports') loadMPPOReports();
+}
+async function loadMPPOMembers() {
+    const box = document.getElementById('mp-po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/po/members'); }
+    catch (e) { if (mpPoTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpPoTab !== 'members') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء حالياً</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
+                <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/po/personnel/','loadMPPOMembers()')">📝 ملاحظة</button>
+            </div>
+        </div>\`).join('');
+}
+async function loadMPPOReports() {
+    const box = document.getElementById('mp-po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/po/reports/pending'); }
+    catch (e) { if (mpPoTab !== 'reports') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpPoTab !== 'reports') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpPoReportDecide')).join('');
+}
+function mpPoReportDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/mp/po/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadMPPOReports(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/mp/po/reports/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تم قبول التقرير'); loadMPPOReports(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// بوابة عضو الشرطة العسكرية العادي — العساكر (ملاحظة + طلب استدعاء) + تسجيل تقرير
+// ══════════════════════════════════════════════════════════════════════════
+let mpMemberTab = 'members';
+let mpMemberListCache = [];
+function renderMPMemberPanel() {
+    if (!ME.isMilitaryPolice) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🚔 الشرطة العسكرية</h2>
+            <div class="row" style="gap:8px;">
+                <button class="btn sm" onclick="openMPReportForm('renderMPMemberPanel()')">+ تسجيل تقرير جديد</button>
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
+        <div class="card"><input id="mp-member-search" placeholder="بحث بالاسم / اليونت / الرتبة" onkeyup="if(event.key==='Enter') filterMPMemberList();"><button class="btn sm" onclick="filterMPMemberList()">بحث</button></div>
+        <div id="mp-member-content"><div class="card">جارِ التحميل...</div></div>\`;
+    loadMPMemberMembers();
+}
+async function loadMPMemberMembers() {
+    const box = document.getElementById('mp-member-content');
+    if (!box) return;
+    let data;
+    try { data = await api('/api/mp/members'); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    mpMemberListCache = data.list;
+    renderMPMemberList(mpMemberListCache);
+}
+function filterMPMemberList() {
+    const input = document.getElementById('mp-member-search');
+    const q = input ? input.value.trim() : '';
+    if (!q) return renderMPMemberList(mpMemberListCache);
+    const filtered = mpMemberListCache.filter(p =>
+        (p.registeredName || p.discordTag || '').includes(q) ||
+        (p.unit || '').includes(q) ||
+        (p.rank || '').includes(q)
+    );
+    renderMPMemberList(filtered);
+}
+function renderMPMemberList(list) {
+    const box = document.getElementById('mp-member-content');
+    if (!box) return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
+    box.innerHTML = list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    \${p.summon && p.summon.status === 'approved' ? '<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط</div>' : ''}
+                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ في طلب استدعاء بانتظار القيادة</div>' : ''}
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📝 ملاحظة</button>
+                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📣 طلب استدعاء</button>\` : ''}
+                </div>
+            </div>
+        </div>\`).join('');
+}
+// ── فورم تسجيل تقرير الشرطة العسكرية ──
+let mpReportNotes = [];
+let mpReportReturnFn = 'renderMPMemberPanel()';
+function openMPReportForm(returnFn) {
+    mpReportNotes = [];
+    mpReportReturnFn = returnFn || 'renderMPMemberPanel()';
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>📝 تسجيل تقرير شرطة عسكرية</h2><button class="btn gray sm" onclick="\${mpReportReturnFn}">رجوع</button></div>
+        <div class="card">
+            <label>1) وش سويت بالاستلام؟</label>
+            <textarea id="mpr-duty" placeholder="اكتب وش سويت خلال الاستلام..."></textarea>
+        </div>
+        <div class="card">
+            <label>2) كم عدد الجولات/الدوريات اللي سويتها خلال الشفت؟</label>
+            <input type="number" id="mpr-patrols" min="0" placeholder="0">
+        </div>
+        <div class="card">
+            <label>3) كم عدد الاستدعاءات اللي نفّذتها خلال الشفت؟</label>
+            <input type="number" id="mpr-summons" min="0" placeholder="0">
+        </div>
+        <div class="card">
+            <label>4) هل واجهتك أي مخالفات أمنية أو حالات مشبوهة؟ اذكرها</label>
+            <textarea id="mpr-incidents" placeholder="اكتب التفاصيل، أو اترك فاضي إذا ما فيه"></textarea>
+        </div>
+        <div class="card">
+            <div class="row"><h3>5) العساكر اللي عطيتهم ملاحظة/تحذير خلال الشفت</h3><button class="btn sm gray" onclick="addMPReportNoteRow()">+ إضافة</button></div>
+            <div id="mpr-notes-list"></div>
+        </div>
+        <div class="card">
+            <label>6) ملاحظات أو توصيات عامة</label>
+            <textarea id="mpr-general" placeholder="أي شي تشوفه مهم تذكره..."></textarea>
+        </div>
+        <div class="card"><button class="btn" onclick="submitMPReport()">إرسال التقرير</button></div>\`;
+}
+function addMPReportNoteRow() {
+    const i = mpReportNotes.length;
+    mpReportNotes.push({ discord: '', tag: '', name: '', kind: 'note', reason: '' });
+    renderMPReportNotesList();
+}
+function renderMPReportNotesList() {
+    const box = document.getElementById('mpr-notes-list');
+    if (!box) return;
+    box.innerHTML = mpReportNotes.map((n, i) => \`
+        <div class="card" style="margin-top:8px;padding:10px 14px;">
+            <div class="row" style="gap:6px;">
+                <input placeholder="اسم/آيدي العسكري" value="\${n.name}" oninput="mpReportNotes[\${i}].name=this.value" style="flex:2;">
+                <select onchange="mpReportNotes[\${i}].kind=this.value" style="flex:1;">
+                    <option value="note" \${n.kind === 'note' ? 'selected' : ''}>ملاحظة</option>
+                    <option value="warning" \${n.kind === 'warning' ? 'selected' : ''}>تحذير</option>
+                </select>
+                <button class="btn danger sm" onclick="removeMPReportNoteRow(\${i})">حذف</button>
+            </div>
+            <textarea placeholder="السبب" oninput="mpReportNotes[\${i}].reason=this.value" style="margin-top:6px;">\${n.reason}</textarea>
+        </div>\`).join('');
+}
+function removeMPReportNoteRow(i) {
+    mpReportNotes.splice(i, 1);
+    renderMPReportNotesList();
+}
+async function submitMPReport() {
+    const dutyReport = document.getElementById('mpr-duty').value;
+    if (!dutyReport || !dutyReport.trim()) return toast('اكتب وش سويت بالاستلام');
+    const body = {
+        dutyReport,
+        patrolsCount: document.getElementById('mpr-patrols').value,
+        summonsCount: document.getElementById('mpr-summons').value,
+        incidents: document.getElementById('mpr-incidents').value,
+        notesIssued: mpReportNotes,
+        generalNotes: document.getElementById('mpr-general').value,
+    };
+    try {
+        const r = await api('/api/mp/reports/submit', { method: 'POST', body: JSON.stringify(body) });
+        toast(r.report && r.report.status === 'approved' ? '✅ تم قبول تقريرك' : '✅ تم إرسال التقرير للمراجعة');
+        Function(mpReportReturnFn)();
+    } catch (e) { toast(e.message); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// بوابة "لديك استدعاء" — تظهر فور تسجيل الدخول لو عليه استدعاء نشط
+// ══════════════════════════════════════════════════════════════════════════
+function checkSummonGate() {
+    if (!ME || !ME.summon || ME.summon.status !== 'approved') return false;
+    const box = document.getElementById('app');
+    const locked = ME.summon.unlockAt && new Date(ME.summon.unlockAt).getTime() > Date.now();
+    if (ME.summon.enteredAt) {
+        // دخل الروم فعلاً، لكن يبقى ممنوع من استخدام الموقع لين قيادة الشرطة العسكرية تنهي الاستدعاء
+        box.innerHTML = \`
+            <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
+                <h2 style="color:#f59e0b;">⏳ بانتظار إنهاء الاستدعاء</h2>
+                <p style="color:var(--muted);margin-top:8px;">دخلت الاستدعاء — ما تقدر تستخدم الموقع لين تنهي قيادة الشرطة العسكرية الاستدعاء.</p>
+                <div class="row" style="gap:8px;margin-top:16px;justify-content:center;">
+                    <button class="btn gray sm" onclick="window.open('${CONFIG.MP_SUMMON_VOICE_URL}','_blank')">🚪 فتح الروم مرة ثانية</button>
+                    <button class="btn sm" onclick="init()">🔄 تحديث</button>
+                </div>
+            </div>\`;
+    } else {
+        box.innerHTML = \`
+            <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
+                <h2 style="color:#f59e0b;">📣 لديك استدعاء</h2>
+                <p style="color:var(--muted);margin-top:8px;">استدعاء من الشرطة العسكرية — \${ME.summon.timeLabel || 'الآن'}</p>
+                \${locked
+                    ? \`<button class="btn gray" style="margin-top:16px;" onclick="toast('الروم بيفتح الساعة \${ME.summon.timeLabel}')">🔒 دخول الاستدعاء</button>\`
+                    : \`<button class="btn" style="margin-top:16px;" onclick="enterSummon()">🚪 دخول الاستدعاء</button>\`}
+            </div>\`;
+    }
+    document.getElementById('nav-links').innerHTML = '';
+    document.getElementById('mobile-menu').innerHTML = '';
+    return true;
+}
+async function enterSummon() {
+    try {
+        const r = await api('/api/summon/enter', { method: 'POST' });
+        window.open(r.url, '_blank');
+        toast('✅ تفضل ادخل الروم');
+        ME.summon.enteredAt = new Date().toISOString();
+        checkSummonGate();
+    } catch (e) {
+        toast(e.message);
+    }
+}
+
+async function loadPersonnel() {
+    const box = document.getElementById('admin-content');
+    box.innerHTML = \`<div class="card row"><h3 style="margin:0;">الحسابات</h3><button class="btn sm" style="background:#78350f;color:#fff;" onclick="openWarnAllForm()">📢 إشعار للجميع</button></div><div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
+    searchPersonnel();
+}
+let personnelCache = [];
+async function searchPersonnel() {
+    const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
+    const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+    if (currentAdminTab !== 'personnel') return; // المستخدم غيّر التبويب أثناء التحميل
+    personnelCache = list;
+    const pListEl = document.getElementById('p-list');
+    if (!pListEl) return;
+    pListEl.innerHTML = list.map((p, i) => \`
+        <div class="card" id="pcard-\${i}">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="toggleEdit(\${i})">تعديل</button>
+                    <button class="btn sm gray" onclick="addNote('\${p.discord}')">ملاحظة</button>
+                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/senior/personnel/')">⚠️ تحذير</button>
+                    <button class="btn sm \${p.isBlocked ? '' : 'danger'}" onclick="toggleBlock('\${p.discord}', \${!p.isBlocked})">\${p.isBlocked ? 'إلغاء الإيقاف' : 'إيقاف (بند)'}</button>
+                    <button class="btn sm danger" onclick="deletePersonnel('\${p.discord}', '\${(p.registeredName || p.discordTag || '').replace(/'/g, "\\\\'")}')">🗑️ حذف نهائي</button>
+                </div>
+            </div>
+            <div id="pedit-\${i}" class="hidden" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label>الاسم</label><input id="pe-name-\${i}" value="\${p.registeredName || ''}">
+                <label>اليونت</label><input id="pe-unit-\${i}" value="\${p.unit || ''}">
+                <label>الرتبة العسكرية</label>
+                <select id="pe-rank-\${i}">\${MILITARY_RANKS.map(r => \`<option \${r === p.rank ? 'selected' : ''}>\${r}</option>\`).join('')}</select>
+                <label>النقاط</label><input type="number" id="pe-points-\${i}" data-original="\${p.points}" value="\${p.points}">
+                <button class="btn sm" onclick="saveEdit('\${p.discord}', \${i})">حفظ التعديلات</button>
+            </div>
+        </div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا نتائج</div>';
+}
+function toggleEdit(i) {
+    document.getElementById('pedit-' + i).classList.toggle('hidden');
+}
+async function saveEdit(discordId, i) {
+    const pointsInput = document.getElementById('pe-points-' + i);
+    const pointsChanged = pointsInput.value !== pointsInput.dataset.original;
+    const body = {
+        name: document.getElementById('pe-name-' + i).value,
+        unit: document.getElementById('pe-unit-' + i).value,
+        rank: document.getElementById('pe-rank-' + i).value,
+        // نرسل النقاط بس إذا الأدمن عدّلها فعلاً بنفسه، عشان النظام يقدر يحسبها تلقائياً وقت تغيير الرتبة بدون ما تظل "معلّقة" على القيمة القديمة
+        points: pointsChanged ? pointsInput.value : '',
+    };
+    try {
+        await api('/api/senior/personnel/' + discordId + '/update', { method: 'POST', body: JSON.stringify(body) });
+        toast('✅ تم حفظ التعديلات');
+        searchPersonnel();
+    } catch (e) { toast(e.message); }
+}
+async function deletePersonnel(discordId, displayName) {
+    if (!confirm('متأكد تبي تحذف حساب "' + (displayName || discordId) + '" نهائياً؟ ما يمكن التراجع عن هذا الإجراء.')) return;
+    try {
+        await api('/api/senior/personnel/' + discordId, { method: 'DELETE' });
+        toast('🗑️ تم حذف الحساب نهائياً');
+        searchPersonnel();
+    } catch (e) { toast(e.message); }
+}
+function addNote(discordId) {
+    openNoteForm(discordId, '/api/senior/personnel/', 'searchPersonnel()');
+}
+function toggleBlock(discordId, blocked) {
+    api('/api/senior/personnel/' + discordId + '/block', { method: 'POST', body: JSON.stringify({ blocked }) })
+        .then(() => { toast('تم التحديث'); searchPersonnel(); }).catch(e => toast(e.message));
+}
+let newVehiclePhoto = null;
+async function loadVehicles() {
+    const box = document.getElementById('admin-content');
+    box.innerHTML = \`
+        <div class="card">
+            <h3>إضافة مركبة</h3>
+            <label>اسم المركبة</label>
+            <input id="veh-name" placeholder="مثال: فورد F150">
+            <label>صورة المركبة</label>
+            <input type="file" id="veh-photo" accept="image/*" onchange="previewVehiclePhoto()">
+            <img id="veh-photo-preview" style="display:none;max-width:160px;border-radius:8px;margin-bottom:10px;">
+            <button class="btn sm" onclick="addVehicle()">إضافة</button>
+        </div>
+        <div id="veh-list" class="vgrid"></div>\`;
+    loadVehicleList();
+}
+function previewVehiclePhoto() {
+    const f = document.getElementById('veh-photo').files[0];
+    if (!f) return;
+    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+        newVehiclePhoto = e.target.result;
+        const img = document.getElementById('veh-photo-preview');
+        img.src = newVehiclePhoto; img.style.display = 'block';
+    };
+    reader.readAsDataURL(f);
+}
+async function addVehicle() {
+    const name = document.getElementById('veh-name').value.trim();
+    if (!name) return toast('حط اسم المركبة');
+    try {
+        await api('/api/senior/vehicles', { method: 'POST', body: JSON.stringify({ name, photo: newVehiclePhoto }) });
+        toast('تمت الإضافة'); newVehiclePhoto = null; loadVehicles();
+    } catch (e) { toast(e.message); }
+}
+async function loadVehicleList() {
+    const { list } = await api('/api/senior/vehicles');
+    if (currentAdminTab !== 'vehicles') return;
+    const box = document.getElementById('veh-list');
+    if (!box) return;
+    box.innerHTML = list.map(v => \`
+        <div class="vcard">
+            \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+            <div>\${v.name}</div>
+            <button class="btn danger sm" style="margin-top:4px;padding:3px 8px;font-size:10px;" onclick="delVehicle('\${v._id}')">حذف</button>
+        </div>\`).join('') || '<p style="color:var(--muted);">لا توجد مركبات</p>';
+}
+function delVehicle(id) {
+    api('/api/senior/vehicles/' + id, { method: 'DELETE' }).then(() => { toast('تم الحذف'); loadVehicleList(); });
+}
 async function loadHire() {
     const box = document.getElementById('admin-content');
     box.innerHTML = \`
